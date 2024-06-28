@@ -1,0 +1,124 @@
+body {
+    font-family: Arial, sans-serif;
+    background: linear-gradient(skyblue, lightgreen);
+    margin: 0;
+ }
+
+ #banner {
+    background-image: url('./assets/images/background.jpeg');
+    background-size: cover;
+    background-position: center;
+    height: 37vh;
+    display: flex;
+    justify-content: space-between;
+    flex-direction: column;
+    align-items: center;
+ }
+
+ #title {
+    background-color: transparent;
+    color: #000;
+    padding: 10px;
+    opacity: 0.7;
+ }
+
+ #profile-image {
+    background-image: url('./assets/images/me.jpeg');
+    background-size: cover;
+    background-position: right;
+    width: 200px;
+    height: 200px;
+    border-radius: 50%;
+    margin-bottom: -64px;
+ }
+
+ #contact-left, #contact-right {
+    display: flex;
+    flex: 1;
+    justify-content: center;
+ }
+
+ #contacts {
+    display: flex;
+    justify-content: center;
+    margin: 20px;
+ }
+
+ #github, #linkedin, #gmail, #resume {
+    width: 50px;
+    height: 50px;
+    border-radius: 50%;
+    margin-right: 10px;
+    background: none;
+ }
+
+ #about {
+    text-indent: 2em;
+    margin: 10px;
+    padding: 10px;
+    border-top: 1px solid black;
+    border-bottom: 1px solid black;
+ }
+
+ #content {
+    display: flex;
+    justify-content: center;
+ }
+
+ #projects, #fun {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin: 10px;
+ }
+
+ /* all list-links should have the same size */
+ .list-link {
+    text-decoration: none;
+    color: #FFF;
+    width: 80%;
+ }
+ .item-label {
+    background-color: #000;
+    opacity: 0.6;
+    width: 100%;
+    margin: 0;
+    padding-left: 10px;
+ }
+ .list-item {
+    display: flex;
+    background-size: cover;
+    background-position: center;
+    margin: 10px;
+    margin-top: 0;
+    border: 1px solid black;
+    border-radius: 5px;
+    height: 10vh;
+    width: 80%;
+    align-items: flex-end;
+    text-decoration: none;
+ }
+
+ #roama {
+    background-image: url('./assets/images/roama.jpeg');
+    background-position: 50% 60%;
+ }
+ #soccer-mp {
+    background-image: url('./assets/images/soccer.jpeg');
+ }
+ #movie-rag {
+    background-image: url('./assets/images/wotcher.jpeg');
+ }
+ #marathon {
+    background-image: url('./assets/images/marathon.jpeg');
+    background-position: 50% 55%;
+ }
+ #cat-pics {
+    background-image: url('./assets/images/cat.JPG');
+    background-position: 50% 45%;
+ }
+ #awesome {
+    background-image: url('./assets/images/awesome.jpeg');
+    background-position: 50% 33%;
+ }
