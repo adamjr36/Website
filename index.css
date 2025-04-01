@@ -13,6 +13,27 @@ body {
     justify-content: space-between;
     flex-direction: column;
     align-items: center;
+    position: relative;
+ }
+
+ #banner-caption {
+    position: absolute;
+    bottom: 0;
+    left: calc(50% + 100px);
+    right: 0;
+    background-color: rgba(0, 0, 0, 0.7);
+    color: white;
+    padding: 10px;
+    text-align: center;
+    opacity: 0;
+    transition: opacity 0.3s ease-in-out;
+    font-size: 0.9em;
+    border-radius: 5px;
+    margin-bottom: 10px;
+ }
+
+ #banner:hover #banner-caption {
+    opacity: 1;
  }
 
  #title {
