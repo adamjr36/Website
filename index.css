@@ -127,15 +127,14 @@ body {
     text-decoration: none;
  }
 
- #roama {
-    background-image: url('./assets/images/roama.jpeg');
-    background-position: 50% 60%;
+ #reclaim {
+    background-image: url('./assets/images/reclaim.png');
+ }
+ #pnl67 {
+    background-image: url('./assets/images/pnl67.png');
  }
  #soccer-mp {
     background-image: url('./assets/images/soccer.jpeg');
- }
- #movie-rag {
-    background-image: url('./assets/images/wotcher.jpeg');
  }
  #marathon {
     background-image: url('./assets/images/marathon.jpeg');
