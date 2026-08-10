@@ -735,53 +735,6 @@ button:focus-visible {
 
       </style>
 
-      <!-- TEMPORARY debug reporter: paints startup errors on-screen (no stored values shown). Remove once mobile blank-screen is diagnosed. -->
-      <script>
-      (function () {
-         function show(msg) {
-            var d = document.createElement('div');
-            d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#a11;color:#fff;font:12px/1.4 monospace;padding:10px;white-space:pre-wrap;word-break:break-all';
-            d.textContent = msg;
-            (document.body || document.documentElement).appendChild(d);
-         }
-         window.onerror = function (msg, src, line, col) {
-            show('JS error: ' + msg + '\n' + (src || '?') + ':' + line + ':' + col);
-         };
-         window.addEventListener('unhandledrejection', function (e) {
-            show('Unhandled rejection: ' + (e.reason && (e.reason.message || e.reason)));
-         });
-         window.__dcl = false;
-         document.addEventListener('DOMContentLoaded', function () { window.__dcl = true; });
-         window.addEventListener('load', function () {
-            setTimeout(function () {
-               var ids = ['gate', 'status', 'app'], vis = [];
-               for (var i = 0; i < ids.length; i++) {
-                  var el = document.getElementById(ids[i]);
-                  if (el && !el.hidden) { vis.push(ids[i]); }
-               }
-               if (vis.length) { return; }   /* something is showing; all good */
-               var lines = ['DIAG v4 (inline): no view visible 1.5s after load.'];
-               lines.push('origin: ' + location.href);
-               lines.push('script tag loaded=' + window.__gymScriptLoaded + ' errored=' + window.__gymScriptErrored);
-               lines.push('DOMContentLoaded fired=' + window.__dcl + ' readyState=' + document.readyState);
-               try { lines.push('localStorage keys: [' + Object.keys(localStorage).join(', ') + ']'); }
-               catch (err) { lines.push('localStorage ACCESS THREW: ' + err.message); }
-               fetch('./gym.r8.js', { cache: 'reload' }).then(function (r) {
-                  var hdr = 'fresh gym.js HTTP ' + r.status + ' etag=' + (r.headers.get('etag') || '?') + ' age=' + (r.headers.get('age') || '?');
-                  return r.text().then(function (t) {
-                     lines.push(hdr);
-                     lines.push('bytes=' + t.length + ' (expect 121788)');
-                     lines.push('tail: ' + JSON.stringify(t.slice(-40)));
-                     show(lines.join('\n'));
-                  });
-               }).catch(function (err) {
-                  lines.push('fresh gym.js fetch FAILED: ' + err.message);
-                  show(lines.join('\n'));
-               });
-            }, 1500);
-         });
-      })();
-      </script>
    </head>
 
    <body>
@@ -866,10 +819,8 @@ button:focus-visible {
 
       <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 
-      <!-- TEMPORARY debug attrs on the script tag (same diagnosis as the head reporter) -->
       <!-- gym.r8.js inlined (single-file build) -->
       <script>
-window.__gymScriptLoaded = true;
 /* ==========================================================================
    PPL — workout logger
    Plain vanilla JS, no build step, no dependencies.
