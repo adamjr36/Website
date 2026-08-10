@@ -16,7 +16,7 @@
       <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
       <link rel="icon" href="../assets/images/favicon.ico" type="image/x-icon">
-      <link rel="stylesheet" type="text/css" href="./gym.css?v=r8">
+      <link rel="stylesheet" type="text/css" href="./gym.r8.css">
 
       <!-- TEMPORARY debug reporter: paints startup errors on-screen (no stored values shown). Remove once mobile blank-screen is diagnosed. -->
       <script>
@@ -43,12 +43,12 @@
                   if (el && !el.hidden) { vis.push(ids[i]); }
                }
                if (vis.length) { return; }   /* something is showing; all good */
-               var lines = ['DIAG v2: no view visible 1.5s after load.'];
+               var lines = ['DIAG v3 (gym.r8): no view visible 1.5s after load.'];
                lines.push('script tag loaded=' + window.__gymScriptLoaded + ' errored=' + window.__gymScriptErrored);
                lines.push('DOMContentLoaded fired=' + window.__dcl + ' readyState=' + document.readyState);
                try { lines.push('localStorage keys: [' + Object.keys(localStorage).join(', ') + ']'); }
                catch (err) { lines.push('localStorage ACCESS THREW: ' + err.message); }
-               fetch('./gym.js?v=r8', { cache: 'reload' }).then(function (r) {
+               fetch('./gym.r8.js', { cache: 'reload' }).then(function (r) {
                   var hdr = 'fresh gym.js HTTP ' + r.status + ' etag=' + (r.headers.get('etag') || '?') + ' age=' + (r.headers.get('age') || '?');
                   return r.text().then(function (t) {
                      lines.push(hdr);
@@ -149,7 +149,7 @@
       <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 
       <!-- TEMPORARY debug attrs on the script tag (same diagnosis as the head reporter) -->
-      <script src="./gym.js?v=r8" onload="window.__gymScriptLoaded=true" onerror="window.__gymScriptErrored=true"></script>
+      <script src="./gym.r8.js" onload="window.__gymScriptLoaded=true" onerror="window.__gymScriptErrored=true"></script>
    </body>
 
 </html>
