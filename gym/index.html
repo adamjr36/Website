@@ -17,6 +17,38 @@
 
       <link rel="icon" href="../assets/images/favicon.ico" type="image/x-icon">
       <link rel="stylesheet" type="text/css" href="./gym.css">
+
+      <!-- TEMPORARY debug reporter: paints startup errors on-screen (no stored values shown). Remove once mobile blank-screen is diagnosed. -->
+      <script>
+      (function () {
+         function show(msg) {
+            var d = document.createElement('div');
+            d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#a11;color:#fff;font:12px/1.4 monospace;padding:10px;white-space:pre-wrap;word-break:break-all';
+            d.textContent = msg;
+            (document.body || document.documentElement).appendChild(d);
+         }
+         window.onerror = function (msg, src, line, col) {
+            show('JS error: ' + msg + '\n' + (src || '?') + ':' + line + ':' + col);
+         };
+         window.addEventListener('unhandledrejection', function (e) {
+            show('Unhandled rejection: ' + (e.reason && (e.reason.message || e.reason)));
+         });
+         window.addEventListener('load', function () {
+            setTimeout(function () {
+               var ids = ['gate', 'status', 'app'], vis = [];
+               for (var i = 0; i < ids.length; i++) {
+                  var el = document.getElementById(ids[i]);
+                  if (el && !el.hidden) { vis.push(ids[i]); }
+               }
+               if (vis.length) { return; }   /* something is showing; all good */
+               var lsInfo;
+               try { lsInfo = 'localStorage keys: [' + Object.keys(localStorage).join(', ') + ']'; }
+               catch (err) { lsInfo = 'localStorage ACCESS THREW: ' + err.message; }
+               show('DIAG: script loaded but no view is visible 1.5s after load.\n' + lsInfo + '\nUA: ' + navigator.userAgent);
+            }, 1500);
+         });
+      })();
+      </script>
    </head>
 
    <body>
