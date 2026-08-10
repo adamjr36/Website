@@ -1,0 +1,2719 @@
+/* ==========================================================================
+   PPL — workout logger
+   Plain vanilla JS, no build step, no dependencies.
+
+   Sections:
+     0. constants + small helpers
+     1. Store    — localStorage (config, drafts, queue, prefs)
+     2. Api      — Apps Script endpoint (+ demo stub)
+     3. Model    — turns the API state into day/slot view models
+     4. Queue    — offline retry queue
+     5. Render   — DOM
+     6. Actions  — save / variant switch / day switch
+     7. Gate     — first-run setup + settings
+     8. Boot
+   ========================================================================== */
+
+(function () {
+   'use strict';
+
+   /* =======================================================================
+      0. constants + helpers
+      ======================================================================= */
+
+   var DEMO = /[?&]demo=1\b/.test(window.location.search);
+
+   /* ?demo=1&complete=1 — demo variant where every day's program is finished
+      (currentWeek: null), so the "program complete" state and the week override
+      can be seen without a real sheet. */
+   var DEMO_COMPLETE = DEMO && /[?&]complete=1\b/.test(window.location.search);
+
+   /* Demo mode gets its own localStorage namespace. Sharing keys with real mode
+      meant a demo draft for "Push week 3" overwrote the real one, and the demo's
+      always-succeeds stub could eat real queued saves. */
+   var NS = DEMO ? 'gym.demo.' : 'gym.';
+
+   var KEY = {
+      cfg: NS + 'cfg',
+      queue: NS + 'queue',
+      seq: NS + 'queue.seq',
+      bench: NS + 'bench',
+      /* Last good `state` response, so a cold start with no network still has
+         cards to log into — the gym-basement case. Namespaced like everything
+         else, and never written in demo mode. */
+      stateCache: NS + 'stateCache',
+      draft: function (day, week) { return NS + 'draft.' + day + '.' + week; }
+   };
+
+   var CONTRACT_VERSION = '2';
+
+   /* How long the in-memory model may stand in for a fresh server read before a
+      drain (or a force re-validation) must go back to the sheet. `App.fresh`
+      otherwise survives all day — a "Write anyway" tapped in the evening would
+      re-validate against the morning's model and overwrite a session another
+      device logged at noon. Past this age freshSnapshot re-reads state; if that
+      read fails the drain defers rather than writing blind. */
+   var FRESH_MAX_AGE = 3 * 60 * 1000;   /* 3 minutes */
+
+   var BENCH = { BB: 'Bench Press (BB)', DB: 'Bench Press (DB)' };
+   var BENCH_SLOT_TITLE = 'Bench Press';
+   var BENCH_LABEL = { BB: 'Barbell', DB: 'Dumbbell' };
+
+   var FIELDS = ['s1w', 's1r', 's2w', 's2r', 'notes'];
+   var NUM_FIELDS = ['s1w', 's1r', 's2w', 's2r'];
+
+   var DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+   var MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+   function noop() {}
+
+   function $(id) { return document.getElementById(id); }
+
+   function el(tag, cls, text) {
+      var n = document.createElement(tag);
+      if (cls) { n.className = cls; }
+      if (text != null) { n.textContent = text; }
+      return n;
+   }
+
+   function slug(s) {
+      return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+   }
+
+   function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+   function todayISO() {
+      var d = new Date();
+      return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+   }
+
+   /* "2026-08-07" -> "Thu Aug 7" (parsed as local, not UTC) */
+   function prettyDate(iso) {
+      var p = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+      if (!p) { return iso || ''; }
+      var d = new Date(Number(p[1]), Number(p[2]) - 1, Number(p[3]));
+      return DOW[d.getDay()] + ' ' + MON[d.getMonth()] + ' ' + d.getDate();
+   }
+
+   /* Same, but never ambiguous about the year. A cache from 2024 replayed as
+      "Tue Jan 2" reads like this January; the year is what tells the user the
+      numbers on screen are two programs old. */
+   function prettyDateFull(iso) {
+      var p = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+      if (!p) { return iso || ''; }
+      var pretty = prettyDate(iso);
+      return Number(p[1]) === new Date().getFullYear() ? pretty : pretty + ', ' + p[1];
+   }
+
+   /* trims, and normalises "" / null / undefined to "" */
+   function str(v) { return v == null ? '' : String(v).trim(); }
+
+   /* "" -> null, "95" -> 95, "12,5" -> 12.5, junk -> null.
+      Deliberately stricter than Number(): "0x10" and "1e2" are typos on a
+      numeric keypad, not values worth guessing at. Only a comma used as a
+      decimal separator is normalised — "1,000" stays unparseable rather than
+      silently becoming 1. */
+   function numOrNull(v) {
+      var s = str(v);
+      if (s === '') { return null; }
+      if (/^[+-]?\d+,\d+$/.test(s)) { s = s.replace(',', '.'); }
+      if (!/^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(s)) { return null; }
+      var n = Number(s);
+      return isFinite(n) ? n : null;
+   }
+
+   /* non-empty but unparseable -> true. Surfaced to the user; never dropped. */
+   function numInvalid(v) {
+      return str(v) !== '' && numOrNull(v) === null;
+   }
+
+   function trimNum(n) {
+      if (n == null || n === '') { return ''; }
+      var x = Number(n);
+      return isFinite(x) ? String(x) : String(n);
+   }
+
+   /* =======================================================================
+      1. Store
+      ======================================================================= */
+
+   /* localStorage has already refused a write this session. Safari's private
+      mode and a full disk both throw on EVERY setItem, and swallowing that
+      silently meant the app cheerfully reported "Queued ↻" for a set that
+      existed nowhere but the DOM — one reload and the workout was gone.
+      Surfaced once, and the queue falls back to memory (see Queue.write). */
+   var storageDead = false;
+
+   /* Bumped every time this device stops being the device it was: "Forget", or
+      a connect that changes the url/token pair. A POST in flight across that
+      moment belongs to the PREVIOUS account, and its callbacks must not touch
+      anything the new one owns — not the queue, not the cache. Without it a
+      save that failed while the user was forgetting the device re-queued itself
+      out of the closure it was already holding, and the next endpoint entered
+      received the old account's set. */
+   var cfgGen = 0;
+
+   function onStorageFailure() {
+      if (storageDead) { return; }
+      storageDead = true;
+      Toast.show('This device can’t store offline data (private mode or storage full) — ' +
+                 'saves need signal.', 'error');
+   }
+
+   var Store = {
+      get: function (key, fallback) {
+         try {
+            var raw = window.localStorage.getItem(key);
+            return raw == null ? fallback : JSON.parse(raw);
+         } catch (e) { return fallback; }
+      },
+      /* Returns whether the value actually reached the disk. Callers that are
+         about to tell the user something is safe MUST check it. */
+      set: function (key, val) {
+         try { window.localStorage.setItem(key, JSON.stringify(val)); return true; }
+         catch (e) { onStorageFailure(); return false; }
+      },
+      del: function (key) {
+         try { window.localStorage.removeItem(key); } catch (e) { /* noop */ }
+      },
+      /* Every key this app owns in the current namespace. */
+      keys: function (prefix) {
+         var out = [];
+         try {
+            for (var i = 0; i < window.localStorage.length; i++) {
+               var k = window.localStorage.key(i);
+               if (k && k.indexOf(prefix) === 0) { out.push(k); }
+            }
+         } catch (e) { /* storage unavailable */ }
+         return out;
+      },
+
+      /* --- config --- */
+      cfg: function () {
+         var c = Store.get(KEY.cfg, null);
+         if (c && typeof c.url === 'string' && typeof c.token === 'string' && c.url && c.token) { return c; }
+         return null;
+      },
+      /* Pointing the device at a DIFFERENT url/token pair means the cached
+         sheet belongs to the previous account. Keeping it meant a failed load
+         under config B rendered account A's exercises, labelled only "Offline"
+         — the app quietly showing someone else's log. It is also a config
+         GENERATION change, which is what stops a POST already in flight from
+         landing its result on the new account (see cfgGen).
+
+         Returns whether the pair actually reached the disk — a caller about to
+         say "connected" MUST check it, or the next load lands straight back on
+         the gate with nothing to explain why. */
+      setCfg: function (url, token) {
+         var prev = Store.get(KEY.cfg, null);
+         if (!prev || prev.url !== url || prev.token !== token) {
+            Store.clearStateCache();
+            cfgGen++;
+         }
+         return Store.set(KEY.cfg, { url: url, token: token });
+      },
+      clearCfg: function () { Store.del(KEY.cfg); },
+
+      /* --- drafts: in-progress form values, keyed by day + week --- */
+      draft: function (day, week) {
+         var d = Store.get(KEY.draft(day, week), null);
+         if (!d || typeof d !== 'object') { d = {}; }
+         if (!d.entries || typeof d.entries !== 'object') { d.entries = {}; }
+         if (!d.variants || typeof d.variants !== 'object') { d.variants = {}; }
+         return d;
+      },
+      saveDraft: function (day, week, draft) { return Store.set(KEY.draft(day, week), draft); },
+      /* Week numbers a day currently holds a draft for. */
+      draftWeeks: function (day) {
+         var pre = KEY.draft(day, '');
+         return Store.keys(pre).map(function (k) { return Number(k.slice(pre.length)); })
+            .filter(function (w) { return isFinite(w); });
+      },
+      clearDrafts: function () {
+         Store.keys(NS + 'draft.').forEach(Store.del);
+      },
+      dropDraftEntry: function (day, week, exercise) {
+         var d = Store.draft(day, week);
+         if (d.entries[exercise]) {
+            delete d.entries[exercise];
+            Store.saveDraft(day, week, d);
+         }
+      },
+
+      /* --- bench variation preference --- */
+      benchPref: function () {
+         var v = Store.get(KEY.bench, null);
+         return (v === 'BB' || v === 'DB') ? v : null;
+      },
+      setBenchPref: function (v) { Store.set(KEY.bench, v); },
+
+      /* --- cached state (offline cold start) ---
+         Single user, single sheet: the newest good response simply overwrites
+         the previous one, so there is no invalidation to get wrong. Demo mode
+         neither reads nor writes it.
+
+         `fetchedOn` is the day the SERVER was last read, and it is carried
+         through when the cache is refreshed from the local model after a save:
+         the cells we wrote are current, everything else is still as of that
+         read, and the offline strip says "as of" about exactly that. */
+      cacheState: function (json, fetchedOn) {
+         if (DEMO) { return; }
+         Store.set(KEY.stateCache, {
+            v: 1, fetchedOn: fetchedOn || todayISO(), at: Date.now(), state: json
+         });
+      },
+      cachedState: function () {
+         if (DEMO) { return null; }
+         var c = Store.get(KEY.stateCache, null);
+         if (!c || typeof c !== 'object' || c.v !== 1 || !c.state || !c.state.days) { return null; }
+         return c;
+      },
+      clearStateCache: function () { Store.del(KEY.stateCache); }
+   };
+
+   /* =======================================================================
+      2. Api
+      ======================================================================= */
+
+   /* Error classification is driven by the backend's `code` field:
+        'auth'       bad/missing token   -> reopen the gate
+        'config'     server misconfigured (TOKEN unset, tabs/headers unresolved)
+        'validation' bad request         -> retrying can never help
+        'lock'       sheet busy          -> retry later
+        'internal'   unexpected          -> retry later
+        'network'    client-side, never sent by the server
+      Only 'validation' lets the queue discard a save. */
+   function ApiError(message, code) {
+      this.name = 'ApiError';
+      this.message = message || 'Request failed';
+      this.code = code || 'internal';
+   }
+   ApiError.prototype = Object.create(Error.prototype);
+
+   /* Any network gap means the sheet may have moved under us, so the model on
+      screen stops counting as a fresh server view. The queue drain re-reads
+      state before it writes anything (see freshSnapshot). */
+   function netFail() {
+      App.fresh = false;
+      return new ApiError('Network error — offline?', 'network');
+   }
+
+   /* Fallback for a backend older than the code contract. Deliberately excludes
+      "not set"/"not configured": "Script Property TOKEN is not set" is a server
+      config problem, and treating it as auth made the app demand a token that
+      was never wrong. */
+   function codeFromMessage(msg) {
+      var s = String(msg || '');
+      if (/not set|not configured/i.test(s)) { return 'config'; }
+      if (/could not acquire lock|is busy/i.test(s)) { return 'lock'; }
+      if (/token|unauthor|forbidden|not allowed|denied/i.test(s)) { return 'auth'; }
+      /* Without this, a permanently-bad request against an old backend came back
+         as "internal", stayed queued forever, and blocked every later save
+         behind it — the drain stops at the first entry it can't send. */
+      if (/unknown (day|week|exercise)|malformed/i.test(s)) { return 'validation'; }
+      return 'internal';
+   }
+
+   var Api = {
+      buildUrl: function (params) {
+         var cfg = Store.cfg();
+         if (!cfg) { throw new ApiError('Not configured', 'auth'); }
+         var qs = ['token=' + encodeURIComponent(cfg.token)];
+         Object.keys(params || {}).forEach(function (k) {
+            qs.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k]));
+         });
+         return cfg.url + (cfg.url.indexOf('?') === -1 ? '?' : '&') + qs.join('&');
+      },
+
+      parse: function (res, text) {
+         if (res.status === 401 || res.status === 403) {
+            throw new ApiError('Not authorised — check your token', 'auth');
+         }
+         var json;
+         try { json = JSON.parse(text); } catch (e) {
+            /* HTML instead of JSON = wrong URL or access setting: a deployment
+               problem, not something the save should be thrown away over. */
+            throw new ApiError(
+               'Unexpected response from the endpoint. Check the /exec URL and that the deployment is set to "Anyone".',
+               'config'
+            );
+         }
+         if (!json || json.ok !== true) {
+            var msg = (json && (json.error || json.message)) || 'Request failed';
+            var code = (json && json.code) || codeFromMessage(msg);
+            throw new ApiError(msg, code);
+         }
+         return json;
+      },
+
+      /* GET ?token=..&action=.. */
+      get: function (action, params) {
+         var url;
+         try { url = Api.buildUrl(Object.assign({ action: action }, params || {})); }
+         catch (e) { return Promise.reject(e); }
+
+         return fetch(url, { method: 'GET', redirect: 'follow' })
+            .then(function (res) {
+               return res.text().then(function (t) { return Api.parse(res, t); });
+            })
+            .catch(function (e) {
+               if (e instanceof ApiError) { throw e; }
+               throw netFail();
+            });
+      },
+
+      /* POST with a plain body and NO Content-Type header: keeps it a "simple"
+         CORS request so Apps Script never sees a preflight. */
+      post: function (payload) {
+         var cfg = Store.cfg();
+         if (!cfg) { return Promise.reject(new ApiError('Not configured', 'auth')); }
+         var body = JSON.stringify(Object.assign({ token: cfg.token }, payload));
+
+         return fetch(cfg.url, { method: 'POST', body: body, redirect: 'follow' })
+            .then(function (res) {
+               return res.text().then(function (t) { return Api.parse(res, t); });
+            })
+            .catch(function (e) {
+               if (e instanceof ApiError) { throw e; }
+               throw netFail();
+            });
+      },
+
+      ping: function (url, token) {
+         var full = url + (url.indexOf('?') === -1 ? '?' : '&') +
+                    'token=' + encodeURIComponent(token) + '&action=ping';
+         return fetch(full, { method: 'GET', redirect: 'follow' })
+            .then(function (res) {
+               return res.text().then(function (t) { return Api.parse(res, t); });
+            })
+            .catch(function (e) {
+               if (e instanceof ApiError) { throw e; }
+               throw new ApiError('Could not reach that URL — check it and your connection.', 'network');
+            });
+      },
+
+      state: function () { return Api.get('state'); },
+
+      log: function (day, week, date, entries) {
+         return Api.post({ action: 'log', day: day, week: week, date: date, entries: entries });
+      }
+   };
+
+   /* ---------- demo stub (?demo=1) ---------- */
+
+   var DEMO_WEEKS = 12;
+
+   function demoState() {
+      function ex(name, target, note, last, current) {
+         return {
+            name: name,
+            target: target,
+            note: note,
+            current: current || { s1w: null, s1r: null, s2w: null, s2r: null, notes: null },
+            last: last
+         };
+      }
+      function last(week, w1, r1, w2, r2, orm) {
+         return { week: week, s1w: w1, s1r: r1, s2w: w2, s2r: r2, est1rm: orm };
+      }
+
+      /* Expand the compact per-exercise view into the full week-block payload
+         the real backend sends, so the week override has real data to show. */
+      function day(tabName, currentWeek, lastLogged, exs) {
+         var catalog = {};
+         exs.forEach(function (e) { catalog[e.name] = { target: e.target, note: e.note }; });
+
+         var blocks = [];
+         for (var w = 1; w <= DEMO_WEEKS; w++) {
+            (function (week) {
+               var rows = exs.map(function (e) {
+                  var v = null;
+                  if (DEMO_COMPLETE) { v = e.last; }              /* every week filled */
+                  else if (e.last && e.last.week === week) { v = e.last; }
+                  else if (week === currentWeek) { v = e.current; }
+                  return {
+                     exercise: e.name,
+                     s1w: v ? v.s1w : null,
+                     s1r: v ? v.s1r : null,
+                     s2w: v ? v.s2w : null,
+                     s2r: v ? v.s2r : null,
+                     est1rm: v && v.est1rm != null ? v.est1rm : null,
+                     notes: v && v.notes ? v.notes : null
+                  };
+               });
+               var dated = lastLogged && lastLogged.week === week ? lastLogged.date : null;
+               blocks.push({ week: week, date: dated, rows: rows });
+            }(w));
+         }
+
+         return {
+            tabName: tabName,
+            currentWeek: DEMO_COMPLETE ? null : currentWeek,
+            totalWeeks: DEMO_WEEKS,
+            lastLogged: lastLogged,
+            exercises: DEMO_COMPLETE ? [] : exs,
+            catalog: catalog,
+            blocks: blocks
+         };
+      }
+
+      return {
+         ok: true,
+         days: {
+            Push: day('Push', 3, { week: 2, date: '2026-08-05' }, [
+               ex('Barbell OHP', '2 x 6-10 | to failure', 'Priority lift - first, freshest',
+                  last(2, 95, 7, 95, 7, 117.2),
+                  { s1w: 95, s1r: 8, s2w: null, s2r: null, notes: null }),
+               ex('Bench Press (BB)', '2 x 6-10 | to failure', 'Barbell if the bench is free',
+                  last(2, 155, 8, 155, 6, 196.3)),
+               ex('Bench Press (DB)', '2 x 8-12 | to failure', 'Dumbbell alternative',
+                  last(1, 60, 10, 60, 9, 80.0)),
+               ex('Lateral Raise', '2 x 12-20 | to failure', null, null),
+               ex('Tricep Pushdown', '2 x 10-15 | to failure', null,
+                  last(2, 50, 14, 50, 12, 74.7))
+            ]),
+            Pull: day('Pull', 3, { week: 2, date: '2026-08-03' }, [
+               ex('Weighted Pull-Up', '2 x 5-8 | to failure', 'Added weight only', last(2, 25, 6, 25, 5, 30.0)),
+               ex('Horizontal Cable Row', '2 x 8-12 | to failure', null, last(2, 140, 10, 140, 9, 186.7)),
+               ex('Cable Rear Delt Fly', '2 x 12-20 | to failure', null, last(2, 20, 16, 20, 15, 30.7)),
+               ex('Strict Curl', '2 x 8-12 | to failure', 'No body english', last(2, 65, 9, 65, 8, 84.5))
+            ]),
+            Legs: day('Legs', 2, null, [
+               ex('Back Squat', '2 x 5-8 | leave 1 in reserve', 'Priority lift - first, freshest', last(1, 225, 6, 225, 5, 261.0)),
+               ex('Trap Bar Deadlift', '2 x 5-8 | leave 1 in reserve', null, last(1, 275, 6, 275, 6, 319.0)),
+               ex('Bulgarian Split Squat', '2 x 8-12 | to failure', 'Per leg', null),
+               ex('Single-Leg RDL', '2 x 10-15 | to failure', 'Per leg', null)
+            ])
+         }
+      };
+   }
+
+   if (DEMO) {
+      var demoDelay = function (v) {
+         return new Promise(function (r) { setTimeout(function () { r(v); }, 320); });
+      };
+      Api.state = function () { return demoDelay(demoState()); };
+      Api.log = function (day, week, date, entries) {
+         return demoDelay({ ok: true, written: entries.length, cells: entries.length });
+      };
+      Api.ping = function () { return demoDelay({ ok: true, version: CONTRACT_VERSION }); };
+   }
+
+   /* =======================================================================
+      3. Model
+      ======================================================================= */
+
+   var App = {
+      days: [],          /* [{ key, tabName, currentWeek, totalWeeks, blocks, ... }] */
+      day: null,         /* selected day object */
+      date: todayISO(),
+      /* The user picked the date by hand — carried across a resume refresh
+         instead of being silently reset to the new today. */
+      dateEdited: false,
+      /* The calendar day the state was loaded on. iOS keeps a standalone page
+         suspended for days; comparing this to todayISO() on resume is what
+         stops a save from landing in last week's block. */
+      loadedOn: todayISO(),
+      /* start() is in flight — pageshow and visibilitychange both fire on an
+         iOS resume and would otherwise each kick off a full reload. */
+      starting: false,
+      /* Set to the cache record when the app is rendering stale, cached state
+         because the network was unreachable; null whenever the state on screen
+         came straight from the sheet. */
+      offline: null,
+      /* The model was built from a LIVE state read and nothing has failed with a
+         network error since. Only then may a queue drain trust it as the
+         server's view when deciding whether a queued write would clobber
+         something already in the sheet. Cleared by netFail() and by any cached
+         render — see freshSnapshot(). */
+      fresh: false,
+      /* When `fresh` was last set true. freshSnapshot only trusts the model as
+         server truth while this is recent (see FRESH_MAX_AGE). */
+      freshAt: 0,
+      /* url+token the rendered model was built against. A save re-reads the
+         live config from localStorage; if another tab has reconnected this
+         device to a different account since this model was drawn, the two no
+         longer match and the save is blocked with a reload prompt rather than
+         posting one account's numbers into another's sheet. */
+      cfgSig: null
+   };
+
+   /* url+token of the current config, or null. Used to detect a cross-tab
+      reconnect between the render and a save. */
+   function cfgSignature() {
+      var c = Store.cfg();
+      return c ? (c.url + ' ' + c.token) : null;
+   }
+
+   /* The week a day is actually logging into: the manual override if the user
+      set one, otherwise the server's currentWeek (which is null when the
+      program is complete). */
+   function weekOf(day) {
+      if (!day) { return null; }
+      return day.override != null ? day.override : day.currentWeek;
+   }
+
+   function curWeek() { return weekOf(App.day); }
+
+   /* FIRST block carrying `week`, not the last. A duplicated week number (a
+      copy-pasted block whose Week cell was never edited) is a real sheet state,
+      and the backend's findBlock_ resolves it to the first match. Resolving the
+      last one here meant the app rendered one block's exercises and every save
+      was rejected against the other. */
+   function blockFor(day, week) {
+      if (!day || week == null) { return null; }
+      var blocks = day.blocks || [];
+      for (var i = 0; i < blocks.length; i++) {
+         if (blocks[i].week === week) { return blocks[i]; }
+      }
+      return null;
+   }
+
+   /* Overriding into a block the sheet has never dated. That only happens when
+      the block's FIRST write came through an override (which sends date:null),
+      and it leaves the block invisible to the backend's resume rule: currentWeek
+      skips past a half-logged week, the banner reads "Not logged yet", and the
+      next save lands in the following week. Dating such a block is safe in a way
+      that restamping a dated one is not — there is no older date to drag
+      currentWeek back to. */
+   function overrideNeedsDate(day) {
+      if (!day || day.override == null) { return false; }
+      var b = blockFor(day, day.override);
+      return !(b && b.date);
+   }
+
+   /* The date a save writes into the target block's Date cell.
+        auto week          -> App.date (today, or whatever the user picked)
+        override, dated    -> null, i.e. "leave that block's Date alone"
+        override, UNdated  -> whatever the user picked, else null
+      Stamping today onto an older block used to make the backend's resume rule
+      treat that block as an in-progress session: fixing a typo in week 2 on a
+      week-3 day dragged currentWeek back to 2, and the next real workout then
+      overwrote week 2. An undated block has no such date to protect, so the
+      user is offered the field (blank) and nothing is sent unless they fill it. */
+   function saveDate(day) {
+      if (!day) { return App.date; }
+      /* Auto mode. A block with no date yet gets today (the first write of a
+         session dates it). A block that ALREADY has a date echoes its own date
+         rather than today: after a day rollover the resume rule serves
+         yesterday's block as currentWeek, and stamping today onto it would
+         rewrite the real session's date and push the resume window forward off
+         it. Echoing the block's own date is a backend no-op (it rewrites the
+         same value), so the Date cell — and the resume anchor — never moves,
+         while still sending a date the drain's conflict check can test against a
+         sheet that has since moved on. This mirrors the override path, which
+         also never restamps a dated block. */
+      if (day.override == null) {
+         var b = blockFor(day, weekOf(day));
+         return (b && b.date) ? b.date : App.date;
+      }
+      if (!overrideNeedsDate(day)) { return null; }
+      return day.overrideDate || null;
+   }
+
+   /* What the date field and banner show. While overriding a DATED block that's
+      the block's own date — never today, which the save would not write anyway.
+      While overriding an undated block it's the user's pick, if any. */
+   function shownDate(day) {
+      if (!day || day.override == null) { return App.date; }
+      if (overrideNeedsDate(day)) { return day.overrideDate || ''; }
+      return String(blockFor(day, day.override).date);
+   }
+
+   function emptyVals() {
+      return { s1w: '', s1r: '', s2w: '', s2r: '', notes: '' };
+   }
+
+   /* server `current` (or a posted entry) -> string values for comparison/prefill */
+   function valsFrom(obj) {
+      var v = emptyVals();
+      if (!obj) { return v; }
+      NUM_FIELDS.forEach(function (f) { v[f] = trimNum(obj[f]); });
+      v.notes = str(obj.notes);
+      return v;
+   }
+
+   /* Numeric fields compare by VALUE, not by text: "95.0", "095" and "+95" are
+      the same weight as "95", and a string compare left the badge stuck on
+      "Unsaved" forever after a successful save. */
+   function valsEqual(a, b) {
+      return FIELDS.every(function (f) {
+         if (NUM_FIELDS.indexOf(f) === -1) { return str(a[f]) === str(b[f]); }
+         var x = str(a[f]), y = str(b[f]);
+         if (x === '' || y === '') { return x === y; }
+         var nx = numOrNull(x), ny = numOrNull(y);
+         if (nx === null || ny === null) { return x === y; }   /* unparseable: compare as typed */
+         return nx === ny;
+      });
+   }
+
+   function valsEmpty(v) {
+      return FIELDS.every(function (f) { return str(v[f]) === ''; });
+   }
+
+   /* Does a block row hold any set data? */
+   function rowHasData(r) {
+      return r.s1w != null || r.s1r != null || r.s2w != null || r.s2r != null;
+   }
+
+   /* Most recent block before `week` holding data for `name` — the client-side
+      equivalent of the server's `last`, used when a week override means the
+      server-computed history is for the wrong week. */
+   function lastFromBlocks(day, week, name) {
+      var blocks = day.blocks || [];
+      for (var i = blocks.length - 1; i >= 0; i--) {
+         if (blocks[i].week >= week) { continue; }
+         for (var j = 0; j < blocks[i].rows.length; j++) {
+            var r = blocks[i].rows[j];
+            if (r.exercise === name && rowHasData(r)) {
+               return { week: blocks[i].week, s1w: r.s1w, s1r: r.s1r, s2w: r.s2w, s2r: r.s2r, est1rm: r.est1rm };
+            }
+         }
+      }
+      return null;
+   }
+
+   /* The exercises for a given week of a day, in sheet order.
+      The server already sends exactly this for its own currentWeek (with
+      history attached); any other week is reconstructed from `blocks`.
+      Crucially this is per-BLOCK, never the union across blocks — a card for an
+      exercise that isn't in the block being written to could only ever fail. */
+   function exercisesFor(day, week) {
+      if (week == null) { return []; }
+      if (week === day.currentWeek) { return day.exercises || []; }
+
+      /* First match, to agree with the backend — see blockFor(). */
+      var block = blockFor(day, week);
+      if (!block) { return []; }
+
+      return block.rows.map(function (r) {
+         var meta = (day.catalog && day.catalog[r.exercise]) || {};
+         return {
+            name: r.exercise,
+            target: meta.target || null,
+            note: meta.note || null,
+            current: { s1w: r.s1w, s1r: r.s1r, s2w: r.s2w, s2r: r.s2r, notes: r.notes },
+            last: lastFromBlocks(day, week, r.exercise)
+         };
+      });
+   }
+
+   /* Build the render-ready slot list for a day. The two "Bench Press (BB)" /
+      "Bench Press (DB)" rows collapse into ONE slot with a variation toggle. */
+   function buildSlots(day) {
+      var slots = [];
+      var bench = null;
+      var week = weekOf(day);
+      var draft = Store.draft(day.key, week);
+
+      exercisesFor(day, week).forEach(function (ex) {
+         var isBB = ex.name === BENCH.BB;
+         var isDB = ex.name === BENCH.DB;
+
+         if (isBB || isDB) {
+            if (!bench) {
+               bench = {
+                  id: slug(BENCH_SLOT_TITLE),
+                  title: BENCH_SLOT_TITLE,
+                  paired: true,
+                  variants: {},
+                  order: [],
+                  variant: null,
+                  baseline: {},
+                  saving: false,
+                  error: null
+               };
+               slots.push(bench);
+            }
+            var k = isBB ? 'BB' : 'DB';
+            bench.variants[k] = ex;
+            bench.order.push(k);
+            bench.baseline[ex.name] = valsFrom(ex.current);
+         } else {
+            /* No `id`: it is only ever read as a draft key for the PAIRED
+               (bench) slot, and slug(ex.name) collides across similarly-named
+               exercises. Slots are identified by `idx` — see below. */
+            var s = {
+               title: ex.name,
+               paired: false,
+               variants: { solo: ex },
+               order: ['solo'],
+               variant: 'solo',
+               baseline: {},
+               saving: false,
+               error: null
+            };
+            s.baseline[ex.name] = valsFrom(ex.current);
+            slots.push(s);
+         }
+      });
+
+      if (bench) { bench.variant = pickBenchVariant(bench, day, draft); }
+
+      /* `idx` is the slot's identity in the DOM (data-slot). It has to be the
+         array index, not slug(name): slug() collapses case and punctuation, so
+         "Cable Rear Delt Fly" and "Cable Rear-Delt Fly" produced the same id and
+         cardOf()/readForm() then read the WRONG card's inputs and wrote them to
+         the wrong sheet row. The index is unique by construction. */
+      slots.forEach(function (s, i) { s.idx = i; });
+      return slots;
+   }
+
+   /* Which bench variation to show:
+        1. one the user already picked this week (draft), else
+        2. one that already has values logged this week (resume), else
+        3. the remembered preference, else
+        4. whatever exists (barbell first). */
+   function pickBenchVariant(bench, day, draft) {
+      var avail = bench.order;
+      var chosen = draft.variants[bench.id];
+      if (chosen && avail.indexOf(chosen) !== -1) { return chosen; }
+
+      var withCurrent = avail.filter(function (k) {
+         return !valsEmpty(valsFrom(bench.variants[k].current));
+      });
+      if (withCurrent.length) { return withCurrent[0]; }
+
+      var pref = Store.benchPref();
+      if (pref && avail.indexOf(pref) !== -1) { return pref; }
+      return avail.indexOf('BB') !== -1 ? 'BB' : avail[0];
+   }
+
+   function activeEx(slot) { return slot.variants[slot.variant]; }
+
+   /* Values to show in the inputs: draft wins, then whatever the sheet has. */
+   function initialVals(slot) {
+      var ex = activeEx(slot);
+      var draft = Store.draft(App.day.key, curWeek());
+      var d = draft.entries[ex.name];
+      return d ? valsFrom(d) : valsFrom(ex.current);
+   }
+
+   /* Suggested day = least recently logged; never-logged wins. A day whose
+      program is complete has nothing to log into, so it never wins by default —
+      it's still reachable from the tabs. */
+   function suggestDay(days) {
+      var loggable = days.filter(function (d) {
+         return d.currentWeek != null && (d.exercises || []).length > 0;
+      });
+      var withEx = loggable.length ? loggable
+         : days.filter(function (d) { return (d.exercises || []).length > 0; });
+      var pool = withEx.length ? withEx : days;
+      var best = null;
+      var bestKey = null;
+      pool.forEach(function (d) {
+         /* Three tiers, lowest wins: never logged ('') beats logged-but-undated
+            ('0', a block first written through an override) beats a real date
+            ('2026-…'). Treating an undated log as "never logged" made a day
+            that was logged yesterday win the default slot over one that has
+            genuinely never been touched. */
+         var key = !d.lastLogged ? ''
+                 : (d.lastLogged.date ? String(d.lastLogged.date) : '0');
+         if (bestKey === null || key < bestKey) { best = d; bestKey = key; }
+      });
+      return best || pool[0] || null;
+   }
+
+   function normaliseState(json) {
+      var days = [];
+      var raw = (json && json.days) || {};
+      Object.keys(raw).forEach(function (name) {
+         var d = raw[name] || {};
+         var blocks = Array.isArray(d.blocks) ? d.blocks : [];
+         days.push({
+            /* `key` is the canonical day key the backend expects on POST
+               ("Push"), NOT the tab name — the tab can be renamed to
+               "Day 1 - Push" without every save suddenly failing. */
+            key: name,
+            name: name,
+            tabName: d.tabName || name,
+            currentWeek: d.currentWeek != null ? d.currentWeek : null,
+            totalWeeks: d.totalWeeks != null ? d.totalWeeks : blocks.length,
+            override: null,
+            lastLogged: d.lastLogged || null,
+            exercises: Array.isArray(d.exercises) ? d.exercises : [],
+            catalog: d.catalog || {},
+            blocks: blocks,
+            slots: null
+         });
+      });
+      days.forEach(function (d) { d.slots = buildSlots(d); });
+      return days;
+   }
+
+   /* The inverse of normaliseState: the live model written back out in the wire
+      shape, so the offline cache can be refreshed from it after a save without
+      a second round trip. Client-only fields (override, slots) are deliberately
+      dropped — the cache stores the sheet, not the UI.
+
+      Deep-copied on the way out. Callers hold on to the result (as a conflict
+      snapshot, as the cached payload) while the model keeps being mutated by
+      later syncs, and sharing the block arrays made those two drift into each
+      other. */
+   function serialiseModel() {
+      var days = {};
+      App.days.forEach(function (d) {
+         days[d.key] = {
+            tabName: d.tabName,
+            currentWeek: d.currentWeek,
+            totalWeeks: d.totalWeeks,
+            lastLogged: d.lastLogged,
+            exercises: d.exercises,
+            catalog: d.catalog,
+            blocks: d.blocks
+         };
+      });
+      var out = { ok: true, days: days };
+      try { return JSON.parse(JSON.stringify(out)); } catch (e) { return out; }
+   }
+
+   /* Refresh the offline cache from the model. The cache used to be written
+      ONLY on a successful state GET, so every save made the cached copy one
+      write staler: a cold start days later replayed a week the sheet had long
+      since finished, and the next offline session was logged straight over it.
+      `fetchedOn` is preserved — the sheet was not re-read, only patched.
+
+      Only ever from a FRESH model. A model rendered out of the cache during an
+      offline cold start is, by definition, no newer than the cache — and it can
+      be a great deal older than what the drain running alongside it has just
+      fetched. Republishing it wrote a week-old view back over a minutes-old
+      one and inherited its `fetchedOn`, so the staleness strip went quiet about
+      data that was still stale. When the model isn't fresh the caller patches
+      the cached payload instead (cachePatch) and leaves its `fetchedOn` alone. */
+   function cacheFromModel() {
+      if (DEMO || !App.days.length || !App.fresh) { return; }
+      var c = Store.cachedState();
+      Store.cacheState(serialiseModel(), c && c.fetchedOn);
+   }
+
+   /* The non-fresh half of the above: fold ONE written entry into whatever the
+      cache currently holds, keeping the cache's own `fetchedOn`. The cells we
+      wrote are ours to update; everything else stays as of the last real read,
+      whoever wrote it. */
+   function cachePatch(dayKey, week, date, entry) {
+      if (DEMO) { return; }
+      var c = Store.cachedState();
+      if (!c) { return; }
+      patchRaw(c.state, dayKey, week, date, entry);
+      Store.cacheState(c.state, c.fetchedOn);
+   }
+
+   /* After a direct save lands: refresh the cache the honest way for whichever
+      of the two the model happens to be. */
+   function cacheAfterWrite(dayKey, week, date, entry) {
+      if (App.fresh) { cacheFromModel(); } else { cachePatch(dayKey, week, date, entry); }
+   }
+
+   /* One sheet cell compared with one wire value. Numeric by value ("95.0" is
+      "95"), textual otherwise; null/""/undefined are all "empty". */
+   function cellEq(a, b) {
+      var x = str(a == null ? '' : a), y = str(b == null ? '' : b);
+      if (x === '' || y === '') { return x === y; }
+      var nx = numOrNull(x), ny = numOrNull(y);
+      if (nx === null || ny === null) { return x === y; }
+      return nx === ny;
+   }
+
+   function cellEmpty(v) { return str(v == null ? '' : v) === ''; }
+
+   /* A detached copy of the five cells of some "other side" — a queue item's
+      pre-edit baseline, or the sheet snapshot a "Write anyway" was granted
+      against. Copied, because the sources (a slot's baseline object, a conflict
+      payload) are replaced as the model syncs, and the in-memory queue holds
+      references rather than getting the disk queue's JSON round trip. */
+   function baseSnapshot(v) {
+      if (!v) { return null; }
+      var out = {};
+      FIELDS.forEach(function (f) { out[f] = (v[f] == null) ? '' : v[f]; });
+      return out;
+   }
+
+   /* Do these five cells still hold what `snap` recorded? */
+   function cellsMatch(snap, row) {
+      if (!snap || !row) { return false; }
+      return FIELDS.every(function (f) { return cellEq(snap[f], row[f]); });
+   }
+
+   /* Locate a block / row inside a RAW state payload (a fresh GET or a
+      serialised model) — the queue checks its items against one of these, never
+      against the rendered model, which may be showing a different week. */
+   function rawBlock(json, dayKey, week) {
+      var d = json && json.days && json.days[dayKey];
+      var blocks = (d && Array.isArray(d.blocks)) ? d.blocks : [];
+      for (var i = 0; i < blocks.length; i++) {
+         if (blocks[i].week === week) { return blocks[i]; }
+      }
+      return null;
+   }
+
+   function rawRow(block, exercise) {
+      var rows = (block && block.rows) || [];
+      for (var i = 0; i < rows.length; i++) {
+         if (rows[i].exercise === exercise) { return rows[i]; }
+      }
+      return null;
+   }
+
+   /* Apply a written entry to a RAW state payload, mirroring what
+      onEntrySynced/updateBlockRow do to the model. Keeps the cache in step with
+      a drain that ran against a snapshot the model never adopted. */
+   function patchRaw(json, dayKey, week, date, entry) {
+      var d = json && json.days && json.days[dayKey];
+      if (!d) { return; }
+      var block = rawBlock(json, dayKey, week);
+      var row = rawRow(block, entry.exercise);
+      if (row) {
+         row.s1w = syncedValue(entry.s1w, row.s1w);
+         row.s1r = syncedValue(entry.s1r, row.s1r);
+         row.s2w = syncedValue(entry.s2w, row.s2w);
+         row.s2r = syncedValue(entry.s2r, row.s2r);
+         row.notes = syncedValue(entry.notes, row.notes);
+      }
+      if (block && date) { block.date = date; }
+      if (week === d.currentWeek) {
+         (d.exercises || []).forEach(function (ex) {
+            if (ex.name === entry.exercise) { ex.current = mergedCurrent(entry, ex.current); }
+         });
+      }
+      if (date && (d.lastLogged == null || String(date) > String(d.lastLogged.date || ''))) {
+         d.lastLogged = { week: week, date: date };
+      }
+   }
+
+   /* =======================================================================
+      4. Queue — failed / offline saves, retried automatically
+      ======================================================================= */
+
+   var Queue = {
+      /* Every POST — queue drains and direct saves alike — runs through this
+         chain, so two writes for the same exercise can never be in flight at
+         once. Without it, a save that started during a flush could fail, be
+         re-queued, and then be deleted by the older in-flight POST completing
+         and removing "its" entry — the newer value lost, the queue empty, and
+         the sheet left holding the stale number. */
+      chain: Promise.resolve(),
+
+      run: function (fn) {
+         var p = Queue.chain.then(fn);
+         Queue.chain = p.then(noop, noop);
+         return p;
+      },
+
+      /* Set to the live queue the moment localStorage refuses a write. Losing
+         the disk must not lose the set the user just did — but it MUST change
+         what we promise about it, so the pill and the badge both say
+         "this device only" from then on (see renderPending/renderBadge). */
+      mem: null,
+
+      all: function () {
+         if (Queue.mem) { return Queue.mem; }
+         var q = Store.get(KEY.queue, []);
+         return Array.isArray(q) ? q : [];
+      },
+      write: function (items) {
+         if (Queue.mem) { Queue.mem = items; return false; }
+         if (Store.set(KEY.queue, items)) { return true; }
+         /* The disk copy is now a LIE — it still lists items this write was
+            about to remove. Left in place it survived the reload that the memory
+            queue does not, and every already-synced item in it was POSTed a
+            second time. removeItem is not subject to the quota that just
+            refused setItem, so this reliably clears. */
+         Queue.mem = items;
+         Store.del(KEY.queue);
+         return false;
+      },
+      /* Items waiting to be written to the sheet. Conflicted items are NOT
+         pending sync — they are pending a decision, and are counted by the
+         "Needs review" strip instead. */
+      count: function () {
+         return Queue.all().filter(function (it) { return !it.conflict; }).length;
+      },
+      conflicts: function () {
+         return Queue.all().filter(function (it) { return !!it.conflict; });
+      },
+
+      key: function (day, week, exercise) { return day + '|' + week + '|' + exercise; },
+
+      /* Ids must not be reused while an older item with the same key is still in
+         flight. The persisted counter alone isn't enough: it's a read-modify-
+         write on localStorage, which two open instances (or a page that lost the
+         counter but kept the queue) share non-atomically, and both then mint the
+         same id. Mixing in the clock makes a collision need the same millisecond
+         AND the same counter value. */
+      nextId: function () {
+         var n = Number(Store.get(KEY.seq, 0)) + 1;
+         if (!isFinite(n) || n < 1) { n = 1; }
+         Store.set(KEY.seq, n);
+         return Date.now() * 1000 + (n % 1000);
+      },
+
+      has: function (day, week, exercise) {
+         var k = Queue.key(day, week, exercise);
+         return Queue.all().some(function (it) { return it.k === k; });
+      },
+
+      /* ...and is that queued item waiting on the user rather than on signal? */
+      conflicted: function (day, week, exercise) {
+         var k = Queue.key(day, week, exercise);
+         return Queue.all().some(function (it) { return it.k === k && !!it.conflict; });
+      },
+
+      /* newest write for an exercise supersedes any older queued one.
+         Returns whether the item survived onto the disk.
+
+         `base` is the pre-edit baseline: the values this client last knew the
+         SHEET to hold for these cells, and `baseDate` the same for the block's
+         Date cell. Together they are what makes the conflict check able to tell
+         "someone else logged this" from "I am editing my own synced number" —
+         see conflictOf(). */
+      add: function (day, week, date, entry, base, baseDate) {
+         var k = Queue.key(day, week, entry.exercise);
+         var items = Queue.all().filter(function (it) { return it.k !== k; });
+         items.push({
+            id: Queue.nextId(), k: k, day: day, week: week, date: date,
+            entry: entry, base: baseSnapshot(base), baseDate: baseDate || null,
+            /* The account (url+token) this save was made under. A drain refuses
+               to POST any item whose sig no longer matches the device's CURRENT
+               config: between the enqueue and the drain the device may have been
+               pointed at a different sheet — a Settings URL/token change in this
+               tab, or a "Forget"+reconnect in another tab — and cfgGen only
+               guards SAME-tab changes, never another tab's. Captured here, at
+               enqueue, and never re-derived, so it outlives a reload that
+               re-pins App.cfgSig on the same account (legit offline items still
+               drain). null in demo/unconfigured, which matches itself. */
+            sig: cfgSignature(),
+            ts: Date.now()
+         });
+         var stored = Queue.write(items);
+         renderPending();
+         return stored;
+      },
+
+      /* User chose "Write anyway" on a conflicted item: it drains normally from
+         now on — but only for as long as the sheet still says what it said when
+         the user looked. The decision is recorded WITH the facts it was made
+         about (`forceAgainst`), because "Write anyway" can be tapped with no
+         signal at all: nothing is written, the item sits for days, and by the
+         time it drains the sheet may hold a session the user never saw. A force
+         that outlives its own evidence is a blind overwrite, so markConflicts()
+         re-checks it and re-flags if the sheet has moved. */
+      force: function (id) {
+         var items = Queue.all();
+         items.forEach(function (it) {
+            if (it.id !== id) { return; }
+            /* The evidence the decision was made against: the sheet's five cells
+               AND the block's Date. A conflict can be raised by the date arm
+               alone, so a force that ignored the date would outlive a date change
+               it never saw — markConflicts re-checks both. */
+            it.forceAgainst = (it.conflict && it.conflict.sheet)
+               ? baseSnapshot(it.conflict.sheet) : null;
+            it.forceAgainstDate = (it.conflict && it.conflict.sheet)
+               ? (it.conflict.date || null) : undefined;
+            delete it.conflict;
+            it.force = true;
+         });
+         Queue.write(items);
+         renderPending();
+      },
+
+      /* Remove by ID, never by key: the item under a given key may have been
+         superseded since this POST was sent, and that newer item must survive.
+         Only the FIRST match goes — should two ids ever collide anyway, one
+         completed POST must not delete a second, unsent save along with it. */
+      remove: function (id) {
+         var items = Queue.all();
+         for (var i = 0; i < items.length; i++) {
+            if (items[i].id === id) { items.splice(i, 1); break; }
+         }
+         Queue.write(items);
+         renderPending();
+      },
+
+      /* Drop every queued item under a slot's key. A direct save that lands is
+         the newest value for that slot, so any older queued item (pending or
+         conflicted) it superseded must go — otherwise a later drain, or a
+         "Write anyway" on a stale conflict, would re-post the old number over
+         the value just written. No-op when nothing matches. */
+      dropKey: function (day, week, exercise) {
+         var k = Queue.key(day, week, exercise);
+         var all = Queue.all();
+         var items = all.filter(function (it) { return it.k !== k; });
+         if (items.length === all.length) { return; }
+         Queue.write(items);
+         renderPending();
+      },
+
+      /* Sequential drain. Only a "validation" rejection discards an entry —
+         the server is telling us this write can never succeed. Everything else
+         (auth, lock, config, internal, offline) keeps the entry queued and stops
+         the drain; those all clear up on their own or after the user fixes
+         something, and dropping the entry would silently destroy a logged set.
+
+         Nothing is POSTed until a fresh server view is in hand and every item
+         has been checked against it — see freshSnapshot() and markConflicts(). */
+      drain: function () {
+         if (!Queue.all().length) { return Promise.resolve(); }
+         if (!Store.cfg() && !DEMO) { return Promise.resolve(); }
+         /* Which account this drain is for. A "Forget" (or a change of endpoint)
+            can land between the state read and any of the writes that follow,
+            and every one of those steps would otherwise apply the old account's
+            data to the new one's queue, model and cache. */
+         var gen = cfgGen;
+         /* Same account, as a PERSISTED signature. cfgGen only rises on a config
+            change made in THIS tab; it never moves for another tab's reconnect,
+            and it resets to 0 on reload — so it cannot tell a queued item's
+            account from the one configured now. The per-item sig can. Any item
+            whose sig differs belongs to a connection this device has left; those
+            are parked (see markConflicts), never POSTed to whatever is
+            configured now. Surface it so the pending count isn't a silent lie:
+            they will not sync here, only after reconnecting to their own account
+            (or being discarded via Forget). */
+         var sig = cfgSignature();
+         if (Queue.all().some(function (it) { return it.sig != null && it.sig !== sig; })) {
+            Toast.show('Some queued saves are for a different connection and won’t sync here.', 'error');
+         }
+
+         return freshSnapshot().then(function (snap) {
+            /* No fresh view (still offline, or the sheet answered with nothing
+               usable): defer the whole drain. Guessing here is what let a week
+               the sheet had already finished be overwritten. */
+            if (!snap || gen !== cfgGen) { return; }
+
+            var items = markConflicts(snap.json, sig);
+            renderPending();
+            /* Before the early return, not only after the writes: when EVERY
+               item is conflicted there is nothing to POST, and the badges were
+               left showing whatever they said when the save was queued — a card
+               reading "Queued ↻" for something that will never drain on its
+               own. */
+            renderAllBadges();
+            if (!items.length) { return; }
+
+            var problems = [];
+            var wrote = false;
+
+            var step = function (i) {
+               /* Stop dead if the device changed hands mid-drain: everything
+                  from here on — the remaining items, the snapshot, the queue
+                  ids — describes an account this device no longer has. */
+               if (i >= items.length || gen !== cfgGen) { return Promise.resolve(); }
+               var it = items[i];
+               return Api.log(it.day, it.week, it.date, [it.entry])
+                  .then(function () {
+                     if (gen !== cfgGen) { return; }
+                     Queue.remove(it.id);
+                     onEntrySynced(it.day, it.week, it.entry);
+                     patchRaw(snap.json, it.day, it.week, it.date, it.entry);
+                     wrote = true;
+                     return step(i + 1);
+                  })
+                  .catch(function (e) {
+                     if (e.code === 'validation') {
+                        Queue.remove(it.id);        /* unfixable — retrying is pointless */
+                        problems.push(e.message);
+                        return step(i + 1);
+                     }
+                     if (e.code === 'auth') {
+                        openGate(e.message);        /* stays queued; retried after re-auth */
+                        return Promise.resolve();
+                     }
+                     if (e.code !== 'network') { problems.push(e.message); }
+                     return Promise.resolve();      /* keep it queued, stop the drain */
+                  });
+            };
+
+            return step(0).then(function () {
+               if (gen !== cfgGen) { return; }
+               /* The cache must not stay one drain behind the sheet. */
+               if (wrote) { Store.cacheState(snap.json, snap.fetchedOn); }
+               renderPending();
+               renderAllBadges();
+               if (problems.length) { Toast.show(problems[0], 'error'); }
+            });
+         });
+      },
+
+      flush: function () {
+         /* Demo mode has its own queue (KEY is namespaced), but the demo stub
+            answers "ok" to everything, so draining it would only ever pretend.
+            Nothing in demo mode is worth syncing — skip it entirely. */
+         if (DEMO) { return Promise.resolve(); }
+         return Queue.run(Queue.drain);
+      }
+   };
+
+   /* ---------- the drain's view of the sheet ----------------------------- */
+
+   /* A server-truth payload to validate queued writes against, plus the day the
+      server was last actually read.
+
+      When the model on screen came from a live read and nothing has failed
+      since, the model IS that truth (it has been kept in step by
+      onEntrySynced), so no extra round trip is needed. Otherwise — an offline
+      cold start, a drain triggered before start()'s state has landed, a signal
+      gap since the last load — the state is re-read first. If that read fails
+      or comes back empty the answer is null and the caller DEFERS: a queue that
+      cannot be checked is a queue that must not be written. */
+   function freshSnapshot() {
+      /* The model only stands in for a server read while it is genuinely recent.
+         An hours-old "fresh" model is exactly what let a late-day force overwrite
+         a session logged elsewhere meanwhile — so past FRESH_MAX_AGE we re-read
+         (and if that read fails the caller defers, never writes blind). */
+      if (App.fresh && App.days.length && (Date.now() - App.freshAt) <= FRESH_MAX_AGE) {
+         var c = Store.cachedState();
+         return Promise.resolve({
+            json: serialiseModel(),
+            fetchedOn: (c && c.fetchedOn) || todayISO()
+         });
+      }
+      return Api.state()
+         .then(function (json) {
+            if (!json || !json.days || !Object.keys(json.days).length) { return null; }
+            return { json: json, fetchedOn: todayISO() };
+         })
+         .catch(function () { return null; });
+   }
+
+   /* Would this queued item overwrite something the sheet has gained since it
+      was queued? Compares only the cells the item actually WRITES (a null field
+      leaves its cell alone) against the same cells in the fresh payload:
+
+        target cell empty                 -> free to write
+        target cell holds the same value  -> the write is a no-op, let it go
+        target cell holds something else  -> CONFLICT, never resolved silently
+
+      ...with one exception, and it is the difference between a guard and a
+      nuisance. Those three rules alone have no idea what the cell held BEFORE
+      the user edited it, so the two commonest offline edits — clearing a value
+      you logged yourself, and typing over a number you logged yourself — both
+      look exactly like clobbering a stranger's work, and every one of them
+      asked the user to arbitrate. A guard that cries wolf on your own data
+      trains you to hit "Write anyway" without reading it, which is worse than
+      no guard at all.
+
+      So each item carries `base`: what this client last knew the sheet held for
+      those cells. A cell only conflicts when the sheet differs from BOTH the
+      posted value AND that baseline — i.e. the sheet has moved somewhere this
+      client has never seen. Note what this deliberately does NOT excuse: an
+      item queued off a STALE cache has a stale (often empty) baseline, so a
+      real session logged elsewhere in the meantime still differs from both and
+      still conflicts. Items with no baseline at all (queued by an older build)
+      fall back to the original, stricter rule.
+
+      The block's DATE is one of the written cells and gets the same three-way
+      test. It is what still catches the stale-cache session: a device that has
+      been offline since Monday offers week 3 because its cache says week 3 is
+      current, while the sheet has since dated that block and moved on. The set
+      values alone can't see that — they may well be the ones this device wrote
+      itself on Monday — but the date can: the sheet holds a date this client
+      has never seen. A next-day correction is NOT that; there the sheet still
+      holds the date we last read, so it passes on the baseline arm.
+
+      Returns the sheet's side of the clash for the review strip, or null. */
+   function conflictOf(item, row, blockDate) {
+      var base = item.base || null;
+      var clashed = false;
+      FIELDS.forEach(function (f) {
+         var posted = item.entry[f];
+         if (posted === null || posted === undefined) { return; }   /* not written */
+         if (cellEmpty(row[f])) { return; }
+         if (cellEq(row[f], posted)) { return; }
+         /* Still exactly what we last read from it: this is our own edit of our
+            own value, not a collision. */
+         if (base && cellEq(row[f], base[f])) { return; }
+         clashed = true;
+      });
+      /* Gated on `base`, so items queued by a build that recorded no baseline
+         keep their old behaviour rather than being flagged on a guess. */
+      if (base && str(item.date) !== '' && !cellEmpty(blockDate) &&
+          !cellEq(blockDate, item.date) && !cellEq(blockDate, item.baseDate)) {
+         clashed = true;
+      }
+      if (!clashed) { return null; }
+      return {
+         sheet: { s1w: row.s1w, s1r: row.s1r, s2w: row.s2w, s2r: row.s2r, notes: row.notes },
+         date: blockDate || null,
+         at: Date.now()
+      };
+   }
+
+   /* Flag/unflag every queued item against the fresh payload and persist the
+      result. Returns the items that are safe to POST, in queue order.
+      A conflicted item is SKIPPED, not failed — it must not block the ones
+      behind it, and it must not disappear either. */
+   function markConflicts(json, sig) {
+      var items = Queue.all();
+      var out = [];
+      var changed = false;
+
+      items.forEach(function (it) {
+         /* Made under a different connection than the device now holds: this
+            account's `json` is a DIFFERENT log, so conflict-checking against it
+            is meaningless and POSTing to it is exactly the cross-account write
+            the sig guards against. Leave the item untouched (no conflict flag,
+            not POST-eligible) — it stays parked until the device is reconnected
+            to its own account, when it drains normally. Legacy items with no
+            sig (undefined == null) predate this and are treated as matching. */
+         if (it.sig != null && it.sig !== sig) { return; }
+         var block = rawBlock(json, it.day, it.week);
+         var row = rawRow(block, it.entry.exercise);
+
+         /* A force is a decision about specific facts. If the sheet no longer
+            holds the values the user was shown when they made it — the five
+            cells OR the block's Date — the decision was about something else, so
+            drop it and let the check run again. The date arm is gated on the
+            evidence carrying a date (items forced by an older build have none,
+            and keep their old cells-only behaviour). */
+         if (it.force && it.forceAgainst && row &&
+             (!cellsMatch(it.forceAgainst, row) ||
+              (it.forceAgainstDate !== undefined &&
+               !cellEq(it.forceAgainstDate, block && block.date)))) {
+            delete it.force;
+            delete it.forceAgainst;
+            delete it.forceAgainstDate;
+            changed = true;
+         }
+
+         var clash = null;
+         /* No such day/week/exercise in the fresh state: nothing of ours can
+            be clobbering anything. Let the server arbitrate — it answers
+            'validation' and the item is dropped with a message. */
+         if (!it.force && row) { clash = conflictOf(it, row, block && block.date); }
+
+         /* Persist on any CHANGE OF FACTS, not just on flag transitions. An item
+            that stays conflicted while the sheet moves underneath it used to
+            keep its first-detection payload for good: the strip named a value
+            the sheet no longer held, and both buttons acted on that stale
+            picture. When the facts are unchanged the original payload is kept
+            as-is, so `at` still records when the clash was first seen. */
+         var had = it.conflict || null;
+         if (clash) {
+            if (!conflictSame(had, clash)) { it.conflict = clash; changed = true; }
+         } else if (had) {
+            delete it.conflict;
+            changed = true;
+         }
+         if (!clash) { out.push(it); }
+      });
+
+      if (changed) { Queue.write(items); }
+      return out;
+   }
+
+   /* Same clash, re-observed? Compares only the facts (the sheet's cells and the
+      block's date) — never `at`, which would make every re-check look new. */
+   function conflictSame(a, b) {
+      if (!a || !b) { return false; }
+      if (String(a.date || '') !== String(b.date || '')) { return false; }
+      return cellsMatch(a.sheet, b.sheet);
+   }
+
+   /* A wire value ("" = cleared, null = untouched) -> the local model's value. */
+   function syncedValue(posted, previous) {
+      if (posted === '') { return null; }          /* the cell was cleared */
+      if (posted === null || posted === undefined) { return previous; }
+      return posted;
+   }
+
+   /* The posted entry folded onto whatever the model held before. */
+   function mergedCurrent(entry, prev) {
+      prev = prev || {};
+      return {
+         s1w: syncedValue(entry.s1w, prev.s1w),
+         s1r: syncedValue(entry.s1r, prev.s1r),
+         s2w: syncedValue(entry.s2w, prev.s2w),
+         s2r: syncedValue(entry.s2r, prev.s2r),
+         notes: syncedValue(entry.notes, prev.notes)
+      };
+   }
+
+   /* A queued (or direct) write landed — bring the local model in line.
+      Matched on the DAY only: a save started for week 3 can complete after the
+      user has flipped the picker to week 5, and requiring weekOf(day) === week
+      then dropped the update entirely — the draft was already gone, so the card
+      came back reading "Not logged" with Save disabled and the value that was
+      actually written to the sheet was neither visible nor clearable. */
+   function onEntrySynced(dayKey, week, entry) {
+      /* Drop the saved draft only if it still holds exactly what just synced. If
+         the user re-edited this exercise while the older queued value was
+         draining, that newer edit lives in the draft (persisted on every
+         keystroke) and is its only home until re-saved — dropping it blind would
+         lose it on the next reload. A differing draft survives and the card
+         comes back "Unsaved". */
+      var draft = Store.draft(dayKey, week);
+      var de = draft.entries[entry.exercise];
+      if (!de || valsEqual(valsFrom(de), valsFrom(entry))) {
+         Store.dropDraftEntry(dayKey, week, entry.exercise);
+      }
+      var day = App.days.filter(function (d) { return d.key === dayKey; })[0];
+      if (!day) { return; }
+
+      /* Always: the raw block rows, plus the server's view of the current week
+         (`exercises`, which is what exercisesFor() hands back for that week). */
+      updateBlockRow(day, week, entry);
+      if (week === day.currentWeek) {
+         (day.exercises || []).forEach(function (ex) {
+            if (ex.name === entry.exercise) { ex.current = mergedCurrent(entry, ex.current); }
+         });
+      }
+
+      /* Slots and baselines describe the week on screen — only touch them when
+         that is the week that was written. */
+      if (weekOf(day) !== week) { return; }
+      (day.slots || []).forEach(function (slot) {
+         Object.keys(slot.variants).forEach(function (k) {
+            var ex = slot.variants[k];
+            if (ex.name !== entry.exercise) { return; }
+            ex.current = mergedCurrent(entry, ex.current);
+            slot.baseline[ex.name] = valsFrom(ex.current);
+            slot.error = null;
+         });
+      });
+   }
+
+   /* Keep the raw block data in step too, so switching to that week via the
+      override shows what was actually written. */
+   function updateBlockRow(day, week, entry) {
+      (day.blocks || []).forEach(function (b) {
+         if (b.week !== week) { return; }
+         b.rows.forEach(function (r) {
+            if (r.exercise !== entry.exercise) { return; }
+            r.s1w = syncedValue(entry.s1w, r.s1w);
+            r.s1r = syncedValue(entry.s1r, r.s1r);
+            r.s2w = syncedValue(entry.s2w, r.s2w);
+            r.s2r = syncedValue(entry.s2r, r.s2r);
+            r.notes = syncedValue(entry.notes, r.notes);
+         });
+      });
+   }
+
+   /* =======================================================================
+      5. Render
+      ======================================================================= */
+
+   /* Error toasts stay until dismissed, so an unlucky run of failures used to
+      stack up from the bottom of the screen and cover the last card's Save
+      button. Newest wins: never more than MAX on screen at once (the container
+      also scrolls, and only the toasts themselves take pointer events, so the
+      page underneath stays tappable either way). */
+   var MAX_TOASTS = 3;
+
+   /* The stack is fixed to the bottom of the viewport, so it floats over the
+      last card. Reserving its exact height as scroll room under the content is
+      what makes that card's Save button reachable at all while an undismissed
+      error toast is up — capping the stack bounds the problem, it doesn't
+      remove it. Zero when nothing is showing. */
+   function syncToastRoom() {
+      var box = $('toasts');
+      var app = $('app');
+      if (!app || !box) { return; }
+      app.style.setProperty('--toast-room', box.children.length ? box.offsetHeight + 'px' : '0px');
+   }
+
+   /* The stack's height is a function of the VIEWPORT, not just of how many
+      toasts there are: rotating to portrait re-wraps three one-line toasts into
+      three three-line ones, and the room measured in landscape then left the
+      bottom card's Save button buried under them with nowhere to scroll. Every
+      reflow re-measures, coalesced into a frame so a drag-resize is cheap. */
+   var roomQueued = false;
+   function scheduleToastRoom() {
+      if (roomQueued) { return; }
+      roomQueued = true;
+      window.requestAnimationFrame(function () {
+         roomQueued = false;
+         syncToastRoom();
+      });
+   }
+
+   function dropToast(t) {
+      t.remove();
+      syncToastRoom();
+   }
+
+   var Toast = {
+      /* `action` is an optional { label, fn } — a toast that offers something to
+         do never auto-dismisses, or the offer would vanish mid-read. */
+      show: function (msg, kind, action) {
+         var box = $('toasts');
+         while (box.children.length >= MAX_TOASTS) { box.removeChild(box.firstChild); }
+         var t = el('div', 'toast');
+         t.setAttribute('data-kind', kind || 'error');
+         t.appendChild(el('span', 'toast-text', msg));
+         if (action) {
+            var a = el('button', 'toast-act', action.label);
+            a.type = 'button';
+            a.addEventListener('click', function () { dropToast(t); action.fn(); });
+            t.appendChild(a);
+         }
+         var x = el('button', 'toast-x', '×');
+         x.type = 'button';
+         x.setAttribute('aria-label', 'Dismiss');
+         x.addEventListener('click', function () { dropToast(t); });
+         t.appendChild(x);
+         box.appendChild(t);
+         syncToastRoom();
+         /* Anything that isn't an error is informational — it goes on its own.
+            Errors stay: they usually need the user to do something. */
+         if (kind !== 'error' && !action) { setTimeout(function () { dropToast(t); }, 2600); }
+      }
+   };
+
+   function showOnly(which) {
+      ['gate', 'status', 'app'].forEach(function (id) { $(id).hidden = (id !== which); });
+   }
+
+   function showStatus(msg, retry) {
+      showOnly('status');
+      $('status-msg').textContent = msg;
+      var btn = $('status-retry');
+      btn.hidden = !retry;
+      btn.onclick = retry || null;
+   }
+
+   function renderPending() {
+      var n = Queue.count();
+      var b = $('pending');
+      b.hidden = n === 0;
+      /* Never claim more than is true: with localStorage refusing writes these
+         saves live in this tab and nowhere else. */
+      b.textContent = n + (n === 1 ? ' save pending sync' : ' saves pending sync') +
+                      (Queue.mem ? ' — this tab only' : '');
+      b.title = Queue.mem
+         ? 'Not stored on this device — tap to retry now, and don’t close the tab'
+         : 'Tap to retry now';
+      renderConflicts();
+   }
+
+   /* ---- "Needs review": queued saves the sheet would have contradicted ----
+      Shown in the flow, above the cards, listing what we hold against what the
+      sheet holds. The only two ways out are the two buttons — the app resolves
+      nothing on its own in either direction. */
+   function setText(w, r) {
+      var a = cellEmpty(w) ? '' : trimNum(w);
+      var b = cellEmpty(r) ? '' : trimNum(r);
+      if (a && b) { return a + '×' + b; }
+      return a ? a + ' lb' : b + ' reps';
+   }
+
+   function setsLine(v) {
+      var out = [];
+      if (!cellEmpty(v.s1w) || !cellEmpty(v.s1r)) { out.push(setText(v.s1w, v.s1r)); }
+      if (!cellEmpty(v.s2w) || !cellEmpty(v.s2r)) { out.push(setText(v.s2w, v.s2r)); }
+      if (!out.length && !cellEmpty(v.notes)) { out.push('a note'); }
+      return out.length ? out.join(' · ') : 'a clear';
+   }
+
+   function conflictLine(it) {
+      return it.day + ' W' + it.week + ' ' + it.entry.exercise + ' ' + setsLine(it.entry) +
+             ' — the sheet already has ' + setsLine(it.conflict.sheet) +
+             (it.conflict.date ? ' from ' + prettyDateFull(it.conflict.date) : '') + '.';
+   }
+
+   function renderConflicts() {
+      var box = $('conflicts');
+      if (!box) { return; }
+      var items = Queue.conflicts();
+      box.textContent = '';
+      if (!items.length) { box.hidden = true; return; }
+      box.hidden = false;
+
+      box.appendChild(el('h2', 'conflicts-title',
+         'Needs review — ' + items.length + (items.length === 1 ? ' save' : ' saves') + ' not written'));
+
+      items.forEach(function (it) {
+         var row = el('div', 'conflict');
+         row.appendChild(el('p', 'conflict-text', conflictLine(it)));
+         var acts = el('div', 'conflict-actions');
+
+         var write = el('button', 'btn btn-primary conflict-write', 'Write anyway');
+         write.type = 'button';
+         write.addEventListener('click', function () {
+            Queue.force(it.id);
+            Queue.flush();
+         });
+         acts.appendChild(write);
+
+         var drop = el('button', 'btn btn-ghost conflict-drop', 'Discard');
+         drop.type = 'button';
+         drop.addEventListener('click', function () {
+            Queue.remove(it.id);
+            renderAllBadges();
+         });
+         acts.appendChild(drop);
+
+         row.appendChild(acts);
+         box.appendChild(row);
+      });
+   }
+
+   /* Bring the review strip into view — the card badge's only useful action. */
+   function showConflicts() {
+      var box = $('conflicts');
+      if (!box || box.hidden || !box.scrollIntoView) { return; }
+      box.scrollIntoView({ block: 'center' });
+   }
+
+   function renderTabs() {
+      var nav = $('tabs');
+      nav.textContent = '';
+      App.days.forEach(function (d) {
+         var w = weekOf(d);
+         var b = el('button', 'tab');
+         b.type = 'button';
+         b.setAttribute('role', 'tab');
+         b.setAttribute('aria-selected', d === App.day ? 'true' : 'false');
+         b.appendChild(el('span', 'tab-name', d.name));
+         var wk = el('span', 'tab-week', w == null ? 'done' : 'W' + w);
+         if (d.override != null) { wk.classList.add('is-override'); }
+         b.appendChild(wk);
+         b.addEventListener('click', function () { selectDay(d); });
+         nav.appendChild(b);
+      });
+   }
+
+   function renderBanner() {
+      var t = $('banner-text');
+      t.textContent = '';
+      if (!App.day) { return; }
+
+      var day = App.day;
+      var week = weekOf(day);
+
+      t.appendChild(document.createTextNode(day.name + ' — '));
+
+      /* The week is a button: tapping it opens the manual override. Needed for
+         next-day corrections, for a session that ran past midnight, and to
+         reach any week at all once the program is complete. */
+      var wk = el('button', 'week-pick', week == null ? 'Program complete' : 'Week ' + week);
+      wk.type = 'button';
+      wk.id = 'week-pick';
+      wk.setAttribute('aria-label', 'Change the week being logged');
+      /* Read the picker's real state — this button is rebuilt by every
+         re-render, including ones that fire while the picker is open (a save
+         completing, say), and a hardcoded "false" then lied to screen readers. */
+      wk.setAttribute('aria-expanded', $('week-picker').hidden ? 'false' : 'true');
+      if (day.override != null) { wk.classList.add('is-override'); }
+      t.appendChild(wk);
+
+      var shown = shownDate(day);
+      if (week != null) {
+         t.appendChild(document.createTextNode(' — ' + (shown ? prettyDate(shown) : 'no date')));
+      }
+
+      if (day.override != null) {
+         t.appendChild(el('span', 'week-flag', overrideNeedsDate(day)
+            ? 'overriding — writing to week ' + day.override + ', which has no date yet; pick one to date it'
+            : 'overriding — writing to week ' + day.override + ', its date is left as is'));
+      }
+
+      /* A block first written through an override has data but no date. Saying
+         "Not logged yet" about it is simply wrong — say so without a date. */
+      var sub = !day.lastLogged ? 'Not logged yet'
+         : 'Last logged W' + day.lastLogged.week +
+           (day.lastLogged.date ? ' on ' + prettyDate(day.lastLogged.date) : ' — no date');
+      t.appendChild(el('span', 'banner-sub', sub));
+
+      renderWeekPicker();
+
+      /* While overriding a DATED block the field is read-only: the save
+         deliberately leaves that cell alone. An UNdated block is the exception —
+         see overrideNeedsDate(). */
+      var dateInput = $('date');
+      var editable = day.override == null || overrideNeedsDate(day);
+      dateInput.value = shown;
+      dateInput.disabled = !editable;
+      dateInput.title = day.override == null
+         ? 'Date this session is logged under'
+         : (editable
+            ? 'Week ' + day.override + ' has no date — pick one to date it, or leave it blank'
+            : 'Week ' + day.override + '’s own date — an override never rewrites it');
+
+      renderOffline();
+   }
+
+   /* Stale-data disclosure for the offline cold start. Non-blocking on purpose:
+      every card stays live and saves still queue — that is the whole point. */
+   function renderOffline() {
+      var n = $('offline');
+      if (!n) { return; }
+      if (!App.offline) { n.hidden = true; n.textContent = ''; return; }
+      n.hidden = false;
+      /* Both halves of the disclosure matter: HOW old the numbers are (with the
+         year, or a two-year-old cache reads as this month), and WHICH week the
+         saves being typed right now are going to land in. */
+      var week = App.day ? weekOf(App.day) : null;
+      n.textContent = 'Offline — showing ' + (App.day ? App.day.name : 'saved data') +
+                      ' as of ' + prettyDateFull(App.offline.fetchedOn) + '; ' +
+                      (week == null
+                         ? 'pick a week above before saving.'
+                         : 'saves will sync into week ' + week + '.');
+   }
+
+   /* The override control itself: a native <select> (iOS gives it a real
+      picker) listing every week, plus "Auto" to hand control back. */
+   function autoLabel(day) {
+      return day.currentWeek == null ? 'Auto — program complete' : 'Auto — week ' + day.currentWeek;
+   }
+
+   function weekHint(day) {
+      if (day.override == null) { return 'Pick a week to log into a different one than the app chose.'; }
+      return overrideNeedsDate(day)
+         ? 'Manual override — saves go to week ' + day.override +
+           ', which has no date yet. Set the date above to date it, or leave it blank.'
+         : 'Manual override — saves go to week ' + day.override + ', and that week keeps its own date.';
+   }
+
+   function renderWeekPicker() {
+      var box = $('week-picker');
+      var day = App.day;
+      if (!day) { box.textContent = ''; return; }
+
+      /* Options come from the week numbers the blocks actually carry, never
+         1..totalWeeks: totalWeeks is a block COUNT, so a tab with week 4 deleted
+         (1,2,3,5,6) offered a dead "Week 4" and made week 6 unreachable. */
+      var weeks = (day.blocks || []).map(function (b) { return b.week; });
+      if (!weeks.length) { box.textContent = ''; box.hidden = true; return; }
+
+      /* Re-render without rebuilding when nothing about the option list moved:
+         replacing a <select> the user has open closes its native iOS picker
+         mid-tap, and unrelated re-renders (a save completing) fire constantly. */
+      var sig = day.key + '|' + weeks.join(',');
+      var existing = box.querySelector('#week-select');
+      if (existing && box.getAttribute('data-sig') === sig) {
+         var autoOpt = existing.querySelector('option[value="auto"]');
+         if (autoOpt) { autoOpt.textContent = autoLabel(day); }
+         existing.value = day.override != null ? String(day.override) : 'auto';
+         var h = box.querySelector('.week-hint');
+         if (h) { h.textContent = weekHint(day); }
+         return;
+      }
+
+      box.textContent = '';
+      box.setAttribute('data-sig', sig);
+
+      var sel = el('select', 'week-select');
+      sel.id = 'week-select';
+      sel.setAttribute('aria-label', 'Week to log into');
+
+      var auto = el('option', null, autoLabel(day));
+      auto.value = 'auto';
+      sel.appendChild(auto);
+
+      weeks.forEach(function (w) {
+         var o = el('option', null, 'Week ' + w);
+         o.value = String(w);
+         sel.appendChild(o);
+      });
+      sel.value = day.override != null ? String(day.override) : 'auto';
+      box.appendChild(sel);
+
+      box.appendChild(el('p', 'week-hint', weekHint(day)));
+   }
+
+   function lastLine(ex) {
+      var l = ex.last;
+      if (!l) { return { text: 'First time — no history', empty: true }; }
+      var sets = [];
+      if (l.s1w != null || l.s1r != null) { sets.push(trimNum(l.s1w) + '×' + trimNum(l.s1r)); }
+      if (l.s2w != null || l.s2r != null) { sets.push(trimNum(l.s2w) + '×' + trimNum(l.s2r)); }
+      var txt = 'Last wk' + (l.week != null ? ' (W' + l.week + ')' : '') + ': ' +
+                (sets.length ? sets.join(' · ') : '—');
+      if (l.est1rm != null) { txt += ' — 1RM ' + trimNum(l.est1rm); }
+      return { text: txt, empty: false };
+   }
+
+   function makeSetRow(n, ex, vals) {
+      var row = el('div', 'set-row');
+      row.appendChild(el('span', 'set-label', 'S' + n));
+
+      var w = el('input', 'num is-weight');
+      w.type = 'text';
+      w.setAttribute('inputmode', 'decimal');
+      w.setAttribute('data-f', 's' + n + 'w');
+      w.setAttribute('aria-label', 'Set ' + n + ' weight (lb)');
+      w.placeholder = (ex.last && ex.last['s' + n + 'w'] != null) ? trimNum(ex.last['s' + n + 'w']) : 'lb';
+      w.value = vals['s' + n + 'w'];
+      row.appendChild(w);
+
+      row.appendChild(el('span', 'x', '×'));
+
+      var r = el('input', 'num is-reps');
+      r.type = 'text';
+      r.setAttribute('inputmode', 'numeric');
+      r.setAttribute('data-f', 's' + n + 'r');
+      r.setAttribute('aria-label', 'Set ' + n + ' reps');
+      r.placeholder = (ex.last && ex.last['s' + n + 'r'] != null) ? trimNum(ex.last['s' + n + 'r']) : 'reps';
+      r.value = vals['s' + n + 'r'];
+      row.appendChild(r);
+
+      return row;
+   }
+
+   function renderCard(slot) {
+      var ex = activeEx(slot);
+      var vals = initialVals(slot);
+
+      var card = el('article', 'card');
+      card.setAttribute('data-slot', String(slot.idx));
+
+      /* head: name + status badge */
+      var head = el('div', 'card-head');
+      head.appendChild(el('h2', 'ex-name', slot.title));
+      var badge = el('button', 'badge');
+      badge.type = 'button';
+      badge.setAttribute('data-act', 'badge');
+      head.appendChild(badge);
+      card.appendChild(head);
+
+      if (str(ex.target)) { card.appendChild(el('p', 'target', ex.target)); }
+
+      /* variation toggle (bench) */
+      if (slot.paired && slot.order.length > 1) {
+         var seg = el('div', 'variants');
+         seg.setAttribute('role', 'group');
+         seg.setAttribute('aria-label', slot.title + ' variation');
+         ['BB', 'DB'].forEach(function (k) {
+            if (!slot.variants[k]) { return; }
+            var b = el('button', 'seg', BENCH_LABEL[k]);
+            b.type = 'button';
+            b.setAttribute('data-variant', k);
+            b.setAttribute('aria-pressed', slot.variant === k ? 'true' : 'false');
+            seg.appendChild(b);
+         });
+         card.appendChild(seg);
+      }
+
+      if (str(ex.note)) { card.appendChild(el('p', 'note', ex.note)); }
+
+      var ll = lastLine(ex);
+      var lastEl = el('p', 'last' + (ll.empty ? ' is-empty' : ''), ll.text);
+      card.appendChild(lastEl);
+
+      var sets = el('div', 'sets');
+      sets.appendChild(makeSetRow(1, ex, vals));
+      sets.appendChild(makeSetRow(2, ex, vals));
+      card.appendChild(sets);
+
+      /* notes, collapsed unless already written */
+      var toggle = el('button', 'note-toggle', vals.notes ? '− note' : '+ note');
+      toggle.type = 'button';
+      toggle.setAttribute('data-act', 'note');
+      card.appendChild(toggle);
+
+      var notes = el('textarea', 'notes');
+      notes.setAttribute('data-f', 'notes');
+      notes.setAttribute('aria-label', 'Notes');
+      notes.placeholder = 'Notes for this exercise';
+      notes.value = vals.notes;
+      notes.hidden = !vals.notes;
+      card.appendChild(notes);
+
+      var save = el('button', 'save', 'Save');
+      save.type = 'button';
+      save.setAttribute('data-act', 'save');
+      card.appendChild(save);
+
+      return card;
+   }
+
+   function renderCards() {
+      var box = $('cards');
+      box.textContent = '';
+      if (!App.day) { return; }
+
+      if (weekOf(App.day) == null) {
+         var done = el('div', 'complete');
+         done.appendChild(el('h2', 'complete-title', 'Program complete'));
+         done.appendChild(el('p', 'complete-sub',
+            'All ' + (App.day.totalWeeks || 0) + ' weeks of ' + App.day.name + ' have data. ' +
+            'Tap the week above to pick one to edit.'));
+         box.appendChild(done);
+         return;
+      }
+
+      if (!App.day.slots.length) {
+         box.appendChild(el('p', 'empty', 'No exercises in week ' + weekOf(App.day) + ' of this day.'));
+         return;
+      }
+      App.day.slots.forEach(function (slot) { box.appendChild(renderCard(slot)); });
+      renderAllBadges();
+   }
+
+   function cardOf(slot) {
+      return $('cards').querySelector('[data-slot="' + slot.idx + '"]');
+   }
+
+   /* read the live DOM values for a slot */
+   function readForm(slot) {
+      var card = cardOf(slot);
+      var v = emptyVals();
+      if (!card) { return v; }
+      FIELDS.forEach(function (f) {
+         var n = card.querySelector('[data-f="' + f + '"]');
+         if (n) { v[f] = str(n.value); }
+      });
+      return v;
+   }
+
+   var STATE_LABEL = {
+      empty:  'Not logged',
+      dirty:  'Unsaved',
+      saving: 'Saving…',
+      saved:  'Saved ✓',
+      queued: 'Queued ↻',
+      review: 'Needs review',
+      error:  'Failed — retry'
+   };
+
+   function slotState(slot) {
+      if (slot.saving) { return 'saving'; }
+      var ex = activeEx(slot);
+      /* A conflicted item is NOT queued for sync — it is queued for a decision,
+         and it will never drain on its own. Saying "Queued ↻" about it promised
+         the set was on its way and made the badge a dead control: tapping it
+         flushed a queue that deliberately skips this item, so nothing happened,
+         twice, and the strip that actually holds the two ways out was never
+         connected to the card that looked stuck. */
+      if (Queue.has(App.day.key, curWeek(), ex.name)) {
+         return Queue.conflicted(App.day.key, curWeek(), ex.name) ? 'review' : 'queued';
+      }
+      if (slot.error) { return 'error'; }
+      var cur = readForm(slot);
+      var base = slot.baseline[ex.name] || emptyVals();
+      if (!valsEqual(cur, base)) { return 'dirty'; }
+      /* Emptied a field that the sheet has a value in? That's a pending CLEAR,
+         which is a real edit — it must stay saveable, not fall through to
+         "empty" and disable the button. */
+      return valsEmpty(cur) ? 'empty' : 'saved';
+   }
+
+   function renderBadge(slot) {
+      var card = cardOf(slot);
+      if (!card) { return; }
+      var st = slotState(slot);
+      var badge = card.querySelector('.badge');
+      badge.setAttribute('data-state', st);
+      /* "Queued ↻" promises the set is safe on this device. When localStorage
+         refused the write it is only in memory, and the badge has to say so. */
+      badge.textContent = (st === 'queued' && Queue.mem) ? 'Queued — tab only' : STATE_LABEL[st];
+
+      var save = card.querySelector('.save');
+      /* Disabled in `review` too: a conflicted slot must be resolved through the
+         "Needs review" strip (Write anyway / Discard), never silently overwritten
+         by a direct Save that took no review decision. The badge still jumps to
+         the strip when tapped. */
+      save.disabled = (st === 'saving' || st === 'empty' || st === 'review');
+      save.classList.toggle('is-cta', st === 'dirty' || st === 'error');
+      save.textContent = st === 'saving' ? 'Saving…' : (st === 'error' ? 'Retry' : 'Save');
+   }
+
+   function renderAllBadges() {
+      if (!App.day) { return; }
+      App.day.slots.forEach(renderBadge);
+   }
+
+   /* =======================================================================
+      6. Actions
+      ======================================================================= */
+
+   function selectDay(day) {
+      App.day = day;
+      closeWeekPicker();
+      renderTabs();
+      renderBanner();
+      renderCards();
+   }
+
+   /* Manual week override. `w` is a week number, or null to go back to Auto. */
+   function setWeekOverride(w) {
+      var day = App.day;
+      if (!day) { return; }
+      day.override = (w == null || w === day.currentWeek) ? null : w;
+      /* A date picked for one override target means nothing for the next. */
+      day.overrideDate = null;
+      day.slots = buildSlots(day);      /* different week = different rows + drafts */
+      renderTabs();
+      renderBanner();
+      renderCards();
+   }
+
+   function persistDraft(slot) {
+      var ex = activeEx(slot);
+      var week = curWeek();
+      var draft = Store.draft(App.day.key, week);
+      var vals = readForm(slot);
+      if (valsEmpty(vals)) { delete draft.entries[ex.name]; }
+      else { draft.entries[ex.name] = vals; }
+      if (slot.paired) { draft.variants[slot.id] = slot.variant; }
+      Store.saveDraft(App.day.key, week, draft);
+   }
+
+   function switchVariant(slot, k) {
+      if (!slot.variants[k] || slot.variant === k) { return; }
+      persistDraft(slot);                       /* keep what's typed for the old variation */
+      slot.variant = k;
+      slot.error = null;
+      Store.setBenchPref(k);
+
+      var week = curWeek();
+      var draft = Store.draft(App.day.key, week);
+      draft.variants[slot.id] = k;
+      Store.saveDraft(App.day.key, week, draft);
+
+      var oldCard = cardOf(slot);
+      var newCard = renderCard(slot);
+      oldCard.replaceWith(newCard);
+      renderBadge(slot);
+   }
+
+   function toggleNote(slot) {
+      var card = cardOf(slot);
+      var ta = card.querySelector('.notes');
+      var btn = card.querySelector('.note-toggle');
+      ta.hidden = !ta.hidden;
+      btn.textContent = ta.hidden ? '+ note' : '− note';
+      if (!ta.hidden) { ta.focus(); }
+   }
+
+   /* Build the wire entry.
+        null -> leave the cell alone
+        ""   -> clear the cell (only when the user emptied something the sheet
+                actually holds a value for — an untouched empty field must stay
+                null, or every save would wipe the sheet's reference notes)
+        num  -> write it
+      Before this distinction existed, clearing a value posted null, the backend
+      read that as "untouched", nothing was written, and the app still said
+      "Saved ✓". */
+   function entryFrom(slot) {
+      var ex = activeEx(slot);
+      var v = readForm(slot);
+      var base = slot.baseline[ex.name] || emptyVals();
+      var entry = { exercise: ex.name };
+
+      NUM_FIELDS.forEach(function (f) {
+         if (str(v[f]) === '') { entry[f] = str(base[f]) === '' ? null : ''; return; }
+         entry[f] = numOrNull(v[f]);
+      });
+      entry.notes = str(v.notes) === '' ? (str(base.notes) === '' ? null : '') : str(v.notes);
+      return entry;
+   }
+
+   /* Unparseable numbers are a user-visible error, never a silent drop. */
+   function validationError(slot) {
+      var v = readForm(slot);
+      var bad = NUM_FIELDS.filter(function (f) { return numInvalid(v[f]); });
+      if (!bad.length) { return null; }
+      return 'Not a number: ' + bad.map(function (f) {
+         return (f.charAt(1) === '1' ? 'S1 ' : 'S2 ') + (f.charAt(2) === 'w' ? 'weight' : 'reps') +
+                ' “' + str(v[f]) + '”';
+      }).join(', ') + '.';
+   }
+
+   function saveSlot(slot) {
+      if (slot.saving) { return; }
+      var day = App.day;
+      var week = curWeek();
+      if (week == null) { Toast.show('Pick a week first — this program is complete.', 'error'); return; }
+
+      /* Another tab reconnected this device to a different account since this
+         model was drawn: the config in localStorage no longer matches what is on
+         screen, and posting now would write these numbers into the new account's
+         sheet. Block and prompt a reload rather than guess. */
+      if (cfgSignature() !== App.cfgSig) {
+         Toast.show('This device was reconnected in another tab — reload before saving.', 'error');
+         return;
+      }
+
+      var ex = activeEx(slot);
+      var vals = readForm(slot);
+      var base = slot.baseline[ex.name] || emptyVals();
+      if (valsEmpty(vals) && valsEmpty(base)) {
+         Toast.show('Nothing to save on this exercise.', 'error');
+         return;
+      }
+
+      var bad = validationError(slot);
+      if (bad) {
+         slot.error = bad;
+         Toast.show(bad, 'error');
+         renderBadge(slot);
+         return;
+      }
+
+      var entry = entryFrom(slot);
+      /* Captured now, not read again in the callbacks: the user may switch week
+         (or day) while this POST is in flight. */
+      var wireDate = saveDate(day);
+      /* What we believe the sheet holds for these cells right now. Rides along
+         to the queue so a later conflict check can tell our own edit from
+         someone else's session (see conflictOf). */
+      var wireBase = baseSnapshot(base);
+      /* ...and what we believe the block's Date cell holds. A save only rewrites
+         that cell when a date goes out, so this is the baseline for it. */
+      var wireBaseDate = (blockFor(day, week) || {}).date || null;
+      /* Which account this save belongs to. Checked again in both callbacks —
+         "Forget" or a change of endpoint in the meantime means everything this
+         POST knows is about a device that no longer exists. */
+      var gen = cfgGen;
+      persistDraft(slot);
+      slot.error = null;
+
+      /* Stale cached render (offline cold start): the model on screen is not a
+         verified server view, so a direct POST would write blind into whatever
+         week the cache advertised, with none of the drain's freshness or
+         conflict checks. Route it through the queue instead — Queue.add
+         supersedes any older item for this slot, and the flush re-reads state
+         and conflict-checks it before writing (holding it for review, or
+         deferring if still offline). The badge and pending pill carry the
+         state; only a storage failure needs a toast. */
+      if (App.offline) {
+         var storedOffline = Queue.add(day.key, week, wireDate, entry, wireBase, wireBaseDate);
+         if (!storedOffline) {
+            Toast.show('Held in this tab only; this device can’t store it. ' +
+                       'Keep the tab open until it syncs.', 'error');
+         }
+         renderBadge(slot);
+         Queue.flush();
+         return;
+      }
+
+      slot.saving = true;
+      renderBadge(slot);
+
+      /* One writer at a time: drain the queue, then send this one, all on the
+         shared chain so a concurrent flush can't race this save. */
+      Queue.run(function () {
+         return (DEMO ? Promise.resolve() : Queue.drain())
+            .then(function () {
+               /* Re-capture the cell/date baselines AFTER the pre-save drain. If
+                  the drain just landed this slot's own older queued value,
+                  slot.baseline and the block Date now reflect it — capturing
+                  before would have made a re-queue of this two-step edit look
+                  like a stranger's session on the next drain (false "Needs
+                  review"). */
+               wireBase = baseSnapshot(slot.baseline[ex.name] || emptyVals());
+               wireBaseDate = (blockFor(day, week) || {}).date || null;
+               return Api.log(day.key, week, wireDate, [entry]);
+            });
+      })
+         .then(function () {
+            slot.saving = false;
+            /* The account this was for is gone. Landing it anywhere — model,
+               cache, drafts — would resurrect data the user explicitly asked
+               this device to forget, into whatever they connected next. */
+            if (gen !== cfgGen) { return; }
+            /* This direct write is the newest value for the slot; drop any older
+               queued item it superseded (including one the pre-save drain just
+               flagged conflicted) so a later drain or "Write anyway" can't
+               re-post the stale number over it. */
+            Queue.dropKey(day.key, week, ex.name);
+            onEntrySynced(day.key, week, entry);
+            /* No date sent = the block's Date cell wasn't touched, so nothing
+               about "last logged" changed either. */
+            if (wireDate) {
+               /* The block now HAS a date, so the field goes read-only again and
+                  further saves into it stop sending one. */
+               var wroteTo = blockFor(day, week);
+               if (wroteTo) { wroteTo.date = wireDate; }
+               if (day.override === week) { day.overrideDate = null; }
+               if (day.lastLogged == null ||
+                   String(wireDate) > String(day.lastLogged.date || '')) {
+                  day.lastLogged = { week: week, date: wireDate };
+               }
+            }
+            /* The offline cache is only as good as its last refresh. Refreshed
+               here so a cold start tomorrow shows the set that just landed
+               instead of offering its week up for a second logging — from the
+               model when the model is fresh, and by patching the cached payload
+               when it isn't. */
+            cacheAfterWrite(day.key, week, wireDate, entry);
+            if (day === App.day) {
+               renderBanner();
+               renderTabs();
+               /* The slot describes the week that was written; if the user has
+                  since switched weeks, its idx now points at a different card. */
+               if (weekOf(day) === week) { renderBadge(slot); }
+            }
+         })
+         .catch(function (e) {
+            slot.saving = false;
+            /* Same guard as the success path, and this is the dangerous half:
+               re-queueing here put the forgotten account's set back on a device
+               that had just been handed to a different sheet, and the next
+               drain POSTed it there. */
+            if (gen !== cfgGen) {
+               Toast.show('That save was for the previous connection — it wasn’t kept.', 'error');
+               return;
+            }
+            if (e.code === 'network') {
+               var stored = Queue.add(day.key, week, wireDate, entry, wireBase, wireBaseDate);
+               Toast.show(stored
+                  ? 'Offline — queued. It’ll sync automatically.'
+                  : 'Offline — held in this tab only; this device can’t store it. ' +
+                    'Keep the tab open until it syncs.', 'error');
+            } else if (e.code === 'auth') {
+               slot.error = e.message;
+               openGate(e.message);
+               return;
+            } else {
+               slot.error = e.message;
+               Toast.show(e.message, 'error');
+            }
+            if (day === App.day && weekOf(day) === week) { renderBadge(slot); }
+         });
+   }
+
+   function slotFromEvent(e) {
+      var card = e.target.closest ? e.target.closest('.card') : null;
+      if (!card || !App.day) { return null; }
+      var idx = Number(card.getAttribute('data-slot'));
+      return App.day.slots.filter(function (s) { return s.idx === idx; })[0] || null;
+   }
+
+   function wireApp() {
+      var cards = $('cards');
+
+      cards.addEventListener('click', function (e) {
+         var btn = e.target.closest ? e.target.closest('button') : null;
+         if (!btn) { return; }
+         var slot = slotFromEvent(e);
+         if (!slot) { return; }
+
+         if (btn.hasAttribute('data-variant')) { switchVariant(slot, btn.getAttribute('data-variant')); return; }
+         var act = btn.getAttribute('data-act');
+         if (act === 'save') { saveSlot(slot); }
+         else if (act === 'note') { toggleNote(slot); }
+         else if (act === 'badge') {
+            var st = slotState(slot);
+            if (st === 'error' || st === 'dirty') { saveSlot(slot); }
+            else if (st === 'queued') { Queue.flush(); }
+            /* Flushing would skip it by design; the decision lives in the
+               strip, so take the user there rather than doing nothing. */
+            else if (st === 'review') { showConflicts(); }
+         }
+      });
+
+      cards.addEventListener('input', function (e) {
+         if (!e.target.hasAttribute || !e.target.hasAttribute('data-f')) { return; }
+         var slot = slotFromEvent(e);
+         if (!slot) { return; }
+         slot.error = null;
+         persistDraft(slot);
+         renderBadge(slot);
+      });
+
+      $('date').addEventListener('change', function (e) {
+         /* While overriding an undated block the field dates THAT block, not the
+            session — App.date must stay the auto-mode date underneath. (An
+            override onto a dated block leaves the input disabled, so this can
+            only be the undated case.) */
+         if (App.day && App.day.override != null) {
+            App.day.overrideDate = e.target.value || null;
+            renderBanner();
+            return;
+         }
+         App.date = e.target.value || todayISO();
+         App.dateEdited = App.date !== todayISO();
+         renderBanner();
+      });
+
+      $('settings').addEventListener('click', function () { openGate(null); });
+      $('pending').addEventListener('click', function () { Queue.flush(); });
+
+      /* week override */
+      $('banner-text').addEventListener('click', function (e) {
+         var btn = e.target.closest ? e.target.closest('.week-pick') : null;
+         if (btn) { toggleWeekPicker(); }
+      });
+
+      $('week-picker').addEventListener('change', function (e) {
+         if (!e.target || e.target.id !== 'week-select') { return; }
+         var v = e.target.value;
+         setWeekOverride(v === 'auto' ? null : Number(v));
+      });
+
+      window.addEventListener('online', function () {
+         /* Showing stale cache? Regaining the network is the moment to replace
+            it with the real thing — start() flushes the queue on the way. */
+         if (App.offline) { start(); return; }
+         Queue.flush();
+      });
+
+      /* --- iOS standalone resume ---------------------------------------------
+         A home-screen page is suspended, not unloaded: Safari can restore it
+         days later with App.date and the whole week/state model frozen at
+         whatever they were when it was backgrounded. The banner would still
+         read the old date, cards would still show "Saved ✓" from that session,
+         and a save would overwrite the OLD week block and rewrite its Date.
+         So: whenever the page comes back, if the calendar day has turned over
+         since the state was loaded, reload the state before anything can be
+         saved. start() swaps to the loading view, so no card is interactive
+         while the refresh is in flight. */
+      window.addEventListener('pageshow', function () { refreshIfDayChanged(); });
+      document.addEventListener('visibilitychange', function () {
+         if (!document.hidden) { refreshIfDayChanged(); }
+      });
+
+      /* Rotating the phone re-wraps the toast stack; the room reserved under the
+         cards has to follow it or the bottom Save goes under the toasts. */
+      window.addEventListener('resize', scheduleToastRoom);
+      window.addEventListener('orientationchange', scheduleToastRoom);
+   }
+
+   function refreshIfDayChanged() {
+      if (todayISO() === App.loadedOn) { return; }
+      if (!DEMO && !Store.cfg()) { return; }     /* not configured — the gate owns the screen */
+      /* Settings open: reloading would wipe a half-typed URL/token out from
+         under the user. loadedOn stays stale, so the refresh happens on the
+         next resume once the gate is closed. */
+      if (!$('gate').hidden) { return; }
+      start();
+   }
+
+   function toggleWeekPicker() {
+      var box = $('week-picker');
+      var btn = $('week-pick');
+      var open = box.hidden;
+      box.hidden = !open;
+      if (btn) { btn.setAttribute('aria-expanded', open ? 'true' : 'false'); }
+   }
+
+   function closeWeekPicker() {
+      var box = $('week-picker');
+      if (box) { box.hidden = true; }
+   }
+
+   /* =======================================================================
+      7. Gate — first-run setup + settings
+      ======================================================================= */
+
+   var gateWired = false;
+
+   /* "Forget" has been tapped once with unsynced saves still queued, and is
+      waiting for a confirming second tap. Reset whenever the gate is (re)opened. */
+   var forgetArmed = false;
+
+   /* What the gate fields held the last time WE filled them. Anything else in
+      them is the user's own typing — including two empty fields, which is what
+      clearing a rotated token looks like just before pasting the new one. */
+   var gateFilled = { url: '', token: '' };
+
+   function fillGate(cfg) {
+      gateFilled = { url: cfg ? cfg.url : '', token: cfg ? cfg.token : '' };
+      $('gate-url').value = gateFilled.url;
+      $('gate-token').value = gateFilled.token;
+   }
+
+   function gateUntouched() {
+      return $('gate-url').value === gateFilled.url && $('gate-token').value === gateFilled.token;
+   }
+
+   function gateMsg(text, busy) {
+      var p = $('gate-msg');
+      p.hidden = !text;
+      p.textContent = text || '';
+      p.classList.toggle('is-busy', !!busy);
+   }
+
+   function openGate(message) {
+      var wasHidden = $('gate').hidden;
+      forgetArmed = false;   /* a fresh visit to the gate re-arms nothing */
+      showOnly('gate');
+      var cfg = Store.cfg();
+      /* Prefill when the gate is actually being opened, and otherwise only while
+         the fields still hold exactly what we put there. A second auth error
+         arriving while the user is halfway through typing a new token (a queued
+         save draining, say) re-entered here and wiped the field back to the
+         stored — wrong — value. The old test was "both fields are empty", which
+         re-filled the one case where the user had most clearly decided
+         otherwise: both cleared, ready to paste a rotated pair. */
+      if (wasHidden || gateUntouched()) { fillGate(cfg); }
+      $('gate-cancel').hidden = !cfg;
+      $('gate-forget').hidden = !cfg;
+      $('gate-submit').textContent = cfg ? 'Save' : 'Connect';
+      gateMsg(message || null, false);
+      wireGate();
+   }
+
+   function wireGate() {
+      if (gateWired) { return; }
+      gateWired = true;
+
+      $('gate-form').addEventListener('submit', function (e) {
+         e.preventDefault();
+         var url = str($('gate-url').value);
+         var token = str($('gate-token').value);
+         if (!url || !token) { gateMsg('Both fields are required.'); return; }
+         if (!/^https?:\/\//i.test(url)) { gateMsg('The URL must start with https://'); return; }
+
+         var btn = $('gate-submit');
+         btn.disabled = true;
+         gateMsg('Checking…', true);
+
+         Api.ping(url, token)
+            .then(function (json) {
+               btn.disabled = false;
+               /* The endpoint answered, but this device can't keep the answer.
+                  Starting anyway connected for exactly one session and then
+                  bounced back to a gate that said only "Not configured" — the
+                  one thing the user could not have guessed. Stay put and say
+                  what is actually wrong. */
+               if (!Store.setCfg(url, token)) {
+                  gateMsg('Connected, but this device can’t store the connection ' +
+                          '(private mode or storage full). Nothing was saved.');
+                  return;
+               }
+               gateMsg(null);
+               /* Warn, never block: an older deployment still works for most
+                  things, and refusing to connect would be worse than logging
+                  with a known mismatch. Checked on connect only. */
+               if (json && json.version && String(json.version) !== CONTRACT_VERSION) {
+                  Toast.show('Backend is version ' + json.version + ', this app expects ' +
+                             CONTRACT_VERSION + '. Redeploy Code.gs if something misbehaves.', 'error');
+               }
+               start();
+            })
+            .catch(function (err) {
+               btn.disabled = false;
+               gateMsg(err.message || 'Could not connect.');
+            });
+      });
+
+      $('gate-cancel').addEventListener('click', function () {
+         if (!Store.cfg()) { return; }
+         gateMsg(null);
+         if (App.days.length) { showOnly('app'); } else { start(); }
+      });
+
+      $('gate-forget').addEventListener('click', function () {
+         /* Never-synced saves live only in the queue; wiping it below destroys
+            them. If any are pending (or waiting for review), make the first tap
+            a warning that names the count and require a confirming second tap.
+            A zero-pending Forget stays one tap. */
+         var pending = Queue.all().length;
+         if (pending > 0 && !forgetArmed) {
+            forgetArmed = true;
+            gateMsg(pending + (pending === 1 ? ' save has' : ' saves have') +
+                    ' not synced yet and will be lost. Tap “Forget this device” again to confirm.');
+            return;
+         }
+         forgetArmed = false;
+         Store.clearCfg();
+         /* Anything already in flight belongs to the account being forgotten.
+            Bumping the generation is what makes its callbacks no-ops — clearing
+            the queue below is not enough on its own, because a POST that fails
+            afterwards re-adds itself out of the closure it is still holding. */
+         cfgGen++;
+         /* Forgetting the device must not leave ANY of the previous account's
+            data behind. The cache is the obvious half; the queue is the
+            dangerous half — a set logged against the old sheet used to survive
+            "Forget", and the moment a new URL + token were entered it was
+            POSTed straight into someone else's log. The seq counter and the
+            drafts go with it. */
+         Store.clearStateCache();
+         Queue.mem = null;
+         Store.del(KEY.queue);
+         Store.del(KEY.seq);
+         Store.clearDrafts();
+         App.offline = null;
+         App.fresh = false;
+         renderPending();
+         fillGate(null);
+         $('gate-cancel').hidden = true;
+         $('gate-forget').hidden = true;
+         $('gate-submit').textContent = 'Connect';
+         gateMsg('Cleared. Enter the URL and token to reconnect.', true);
+      });
+   }
+
+   /* =======================================================================
+      8. Boot
+      ======================================================================= */
+
+   function start() {
+      if (App.starting) { return; }
+      App.starting = true;
+      /* "fresh" describes the model produced by the LAST successful read. A
+         reload that is still in flight — or one that fails, or one that lands
+         under a different config — has not produced one, and a drain must go
+         and fetch its own view rather than trusting whatever is on screen. */
+      App.fresh = false;
+
+      /* Carry the user's choices across the reload. A resume refresh used to
+         rebuild every day with override:null and reset App.date, so the next
+         Save silently went to a different week (or date) than the banner had
+         been promising before the page was suspended. */
+      var carry = {};
+      App.days.forEach(function (d) {
+         /* The date the user picked for an override travels WITH it. Carrying
+            the week alone put the app back on week 6 with a blank, still-enabled
+            date field, and the next save quietly went back to date:null — the
+            block the user had just dated stayed undated for good. */
+         if (d.override != null) { carry[d.key] = { week: d.override, date: d.overrideDate || null }; }
+      });
+      var prevKey = App.day ? App.day.key : null;
+      var prevDate = App.dateEdited ? App.date : null;
+      /* Only a load that had a REAL, different date behind it is a rollover.
+         loadedOn is set to null by a failed load, and `null !== today` made every
+         recovery after an offline stretch announce "It's a new day" on the same
+         afternoon it had gone offline. */
+      var rolledOver = App.days.length > 0 && App.loadedOn != null && App.loadedOn !== todayISO();
+
+      /* Claimed BEFORE the request, not after it succeeds: pageshow and
+         visibilitychange both fire on an iOS resume, and updating loadedOn only
+         on success let the second one start a duplicate flush + state GET +
+         re-render (and a failed refresh re-fire on every later resume). */
+      App.loadedOn = todayISO();
+
+      showStatus('Loading…', null);
+      closeWeekPicker();
+
+      /* State FIRST, then the flush. The flush used to run first so that the
+         state response could not predate the queued writes — but a drain with no
+         server view in hand is exactly how a week the sheet had already finished
+         got overwritten. Draining afterwards costs nothing: every write is
+         folded back into the model by onEntrySynced, so the screen ends up in
+         the same place, and now every queued item is checked against a state
+         that is genuinely current. */
+      var ctx = { carry: carry, prevKey: prevKey, prevDate: prevDate };
+
+      /* On the queue's chain, so the read still waits for any POST already in
+         flight — reading state past an unfinished write renders the card that
+         is being saved as "Not logged". */
+      Queue.run(Api.state)
+         .then(function (json) {
+            App.starting = false;
+            App.offline = null;
+            /* Cache only what applyState accepted. A well-formed but empty
+               response ("ok, no days") used to replace the last good cache, and
+               the next cold start had nothing left to fall back on. */
+            if (!applyState(json, ctx)) { return; }
+            Store.cacheState(json);
+            App.fresh = true;
+            App.freshAt = Date.now();
+            if (rolledOver) {
+               Toast.show('It’s a new day — reloaded from the sheet.', 'ok');
+            }
+            return Queue.flush().then(surfaceOrphanDrafts);
+         })
+         .catch(function (e) {
+            App.starting = false;
+            /* Do NOT leave loadedOn claiming "today" after a failed load. It was
+               claimed up front to stop pageshow + visibilitychange double-firing,
+               but keeping it on failure meant a refresh that never landed was
+               never retried: the pre-rollover model stayed on screen and the next
+               save wrote YESTERDAY's date into yesterday's block. App.starting
+               still covers the double-fire while a load is actually in flight. */
+            App.loadedOn = null;
+
+            if (e.code === 'auth') { openGate(e.message); return; }
+
+            /* Offline cold start: the sheet is unreachable but the last good
+               state is on this device. Render it — clearly labelled as stale —
+               so the cards, the week override and the offline queue are all
+               usable from the gym basement. Only for a genuine NETWORK failure:
+               an auth or config error means the answer we'd cache-render is not
+               to be trusted, and the user has something to fix. */
+            if (e.code === 'network') {
+               var cached = Store.cachedState();
+               /* No toast here: the #offline strip says the same thing, and it
+                  clears itself the moment real state loads. An error toast would
+                  sit there claiming "offline" long after the network came back. */
+               if (cached && applyState(cached.state, ctx, cached)) { return; }
+            }
+            showStatus(e.message || 'Could not load.', start);
+         });
+   }
+
+   /* Build the whole app from a `state` payload — live or cached; the two must
+      behave identically, week override and clear-sentinel included, or the
+      offline path is a second implementation waiting to rot.
+      `offline` is the cache record when this is a stale render. Returns false
+      when the payload has nothing to show. */
+   function applyState(json, ctx, offline) {
+      App.days = normaliseState(json);
+      if (!App.days.length) {
+         showStatus('The sheet returned no days.', start);
+         return false;
+      }
+      App.offline = offline || null;
+      /* A cached render is never a fresh server view — a drain must go and get
+         one of its own before it writes anything. */
+      if (offline) { App.fresh = false; }
+      /* Pin the account this model belongs to, so a save can tell if another tab
+         has reconnected the device since (see saveSlot's cross-tab guard). */
+      App.cfgSig = cfgSignature();
+      App.date = ctx.prevDate || todayISO();
+      App.dateEdited = !!ctx.prevDate;
+
+      var dropped = [];
+      App.days.forEach(function (d) {
+         var c = ctx.carry[d.key];
+         if (c == null) { return; }
+         var w = c.week;
+         if (!blockFor(d, w)) { dropped.push(d.name + ' week ' + w); return; }
+         d.override = (w === d.currentWeek) ? null : w;
+         if (d.override != null) { d.overrideDate = c.date; }
+         d.slots = buildSlots(d);
+      });
+
+      App.day = (ctx.prevKey && App.days.filter(function (d) { return d.key === ctx.prevKey; })[0]) ||
+                suggestDay(App.days);
+      showOnly('app');
+      renderPending();
+      renderTabs();
+      renderBanner();
+      renderCards();
+      $('foot').textContent = 'lb · 2 working sets · double progression';
+
+      /* Never change the write target silently. */
+      if (dropped.length) {
+         Toast.show('Week override dropped — no longer in the sheet: ' + dropped.join(', ') + '.', 'error');
+      }
+      return true;
+   }
+
+   /* A reload can move a day forward — the sheet advanced to week 4 while the
+      cards on screen were week 3 — and the values typed into the old week are
+      still on disk under their own draft key, invisible and unmentioned. Say so,
+      and offer the one click that brings them back into view. Values that match
+      what the sheet already holds are not "unsaved" and are left alone. */
+   function draftUnsavedCount(day, week) {
+      var draft = Store.draft(day.key, week);
+      var block = blockFor(day, week);
+      return Object.keys(draft.entries || {}).filter(function (name) {
+         var row = rawRow(block, name);
+         return !valsEqual(valsFrom(draft.entries[name]), valsFrom(row));
+      }).length;
+   }
+
+   function surfaceOrphanDrafts() {
+      var found = [];
+      App.days.forEach(function (d) {
+         var cur = weekOf(d);
+         Store.draftWeeks(d.key).forEach(function (w) {
+            if (w === cur || !blockFor(d, w)) { return; }
+            if (draftUnsavedCount(d, w)) { found.push({ day: d, week: w }); }
+         });
+      });
+      /* Two at most: this is a disclosure, not a backlog view, and the stack
+         only holds three toasts. */
+      found.slice(0, 2).forEach(function (o) {
+         Toast.show('Unsaved values from ' + o.day.name + ' W' + o.week +
+                    ' — not shown on this screen.', 'warn',
+                    { label: 'View', fn: function () { selectDay(o.day); setWeekOverride(o.week); } });
+      });
+   }
+
+   function boot() {
+      wireApp();
+      renderPending();
+      if (DEMO || Store.cfg()) { start(); } else { openGate(null); }
+   }
+
+   if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', boot);
+   } else {
+      boot();
+   }
+}());

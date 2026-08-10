@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+
+<html lang="en">
+   <head>
+      <meta charset="UTF-8">
+      <title>PPL</title>
+
+      <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+      <meta name="description" content="Workout logger">
+      <meta name="robots" content="noindex, nofollow">
+      <meta name="color-scheme" content="dark">
+      <meta name="theme-color" content="#0d0f12">
+      <meta name="mobile-web-app-capable" content="yes">
+      <meta name="apple-mobile-web-app-capable" content="yes">
+      <meta name="apple-mobile-web-app-title" content="PPL">
+      <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+      <link rel="icon" href="../assets/images/favicon.ico" type="image/x-icon">
+      <link rel="stylesheet" type="text/css" href="./gym.css">
+   </head>
+
+   <body>
+
+      <!-- ============ setup / settings gate ============ -->
+      <section id="gate" class="gate" hidden>
+         <form id="gate-form" class="gate-card" autocomplete="off">
+            <h1 class="gate-title">PPL</h1>
+            <p class="gate-sub">Connect this device to your log.</p>
+
+            <label class="field">
+               <span class="field-label">Apps Script URL</span>
+               <input id="gate-url" type="url" inputmode="url" required
+                      placeholder="https://script.google.com/macros/s/&hellip;/exec"
+                      spellcheck="false" autocapitalize="off" autocorrect="off">
+            </label>
+
+            <label class="field">
+               <span class="field-label">Token</span>
+               <input id="gate-token" type="password" required
+                      placeholder="shared token"
+                      spellcheck="false" autocapitalize="off" autocorrect="off">
+            </label>
+
+            <p id="gate-msg" class="gate-msg" hidden></p>
+
+            <div class="gate-actions">
+               <button type="button" id="gate-cancel" class="btn btn-ghost" hidden>Cancel</button>
+               <button type="submit" id="gate-submit" class="btn btn-primary">Connect</button>
+            </div>
+
+            <button type="button" id="gate-forget" class="btn btn-link" hidden>Forget this device</button>
+         </form>
+      </section>
+
+      <!-- ============ status / loading ============ -->
+      <section id="status" class="status" hidden>
+         <p id="status-msg" class="status-msg"></p>
+         <button type="button" id="status-retry" class="btn btn-primary" hidden>Retry</button>
+      </section>
+
+      <!-- ============ app ============ -->
+      <div id="app" class="app" hidden>
+
+         <header class="topbar">
+            <h1 class="brand">PPL</h1>
+            <div class="topbar-right">
+               <button type="button" id="pending" class="pending" hidden></button>
+               <button type="button" id="settings" class="icon-btn" aria-label="Settings">
+                  <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" focusable="false">
+                     <circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"></circle>
+                     <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"
+                           d="M19.4 14.2a1.5 1.5 0 0 0 .3 1.65l.05.05a1.8 1.8 0 1 1-2.55 2.55l-.05-.05a1.5 1.5 0 0 0-1.65-.3 1.5 1.5 0 0 0-.9 1.37V20a1.8 1.8 0 1 1-3.6 0v-.08a1.5 1.5 0 0 0-.98-1.37 1.5 1.5 0 0 0-1.65.3l-.05.05A1.8 1.8 0 1 1 4.3 16.3l.05-.05a1.5 1.5 0 0 0 .3-1.65 1.5 1.5 0 0 0-1.37-.9H3a1.8 1.8 0 1 1 0-3.6h.08a1.5 1.5 0 0 0 1.37-.98 1.5 1.5 0 0 0-.3-1.65L4.1 7.4A1.8 1.8 0 1 1 6.65 4.85l.05.05a1.5 1.5 0 0 0 1.65.3H8.4a1.5 1.5 0 0 0 .9-1.37V3a1.8 1.8 0 1 1 3.6 0v.08a1.5 1.5 0 0 0 .9 1.37 1.5 1.5 0 0 0 1.65-.3l.05-.05a1.8 1.8 0 1 1 2.55 2.55l-.05.05a1.5 1.5 0 0 0-.3 1.65v.08a1.5 1.5 0 0 0 1.37.9H21a1.8 1.8 0 1 1 0 3.6h-.08a1.5 1.5 0 0 0-1.37.9z"></path>
+                  </svg>
+               </button>
+            </div>
+         </header>
+
+         <nav id="tabs" class="tabs" aria-label="Workout day"></nav>
+
+         <!-- stale-data notice: shown when the app rendered from the offline
+              cache because the sheet was unreachable. Never blocks the cards. -->
+         <p id="offline" class="offline" role="status" hidden></p>
+
+         <!-- queued saves the sheet would have contradicted. Listed with both
+              ways out spelled as buttons; the app resolves none of them by
+              itself, in either direction. -->
+         <section id="conflicts" class="conflicts" role="status" aria-label="Saves needing review" hidden></section>
+
+         <div class="banner">
+            <div id="banner-text" class="banner-text"></div>
+            <input type="date" id="date" class="date-input" aria-label="Workout date">
+         </div>
+
+         <!-- manual week override, opened by tapping the week in the banner -->
+         <div id="week-picker" class="week-picker" hidden></div>
+
+         <main id="cards" class="cards"></main>
+
+         <p id="foot" class="foot"></p>
+      </div>
+
+      <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+      <script src="./gym.js"></script>
+   </body>
+
+</html>

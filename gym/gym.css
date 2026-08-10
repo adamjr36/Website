@@ -1,0 +1,714 @@
+/* ==========================================================================
+   PPL — workout logger
+   v1 is deliberately plain. Every colour, space and radius is a custom
+   property below; restyle by editing this :root block first.
+   ========================================================================== */
+
+:root {
+   /* --- palette --- */
+   --bg:            #0d0f12;
+   --bg-raised:     #161a1f;
+   --bg-sunken:     #0a0c0f;
+   --bg-input:      #1d222a;
+   --border:        #262c35;
+   --border-strong: #39424f;
+
+   --text:          #f2f5f8;
+   --text-dim:      #9aa5b3;
+   --text-faint:    #67717e;
+
+   --accent:        #4ea1ff;
+   --accent-ink:    #06121f;
+   --ok:            #3ddc84;
+   --warn:          #ffb020;
+   --danger:        #ff5f56;
+
+   /* --- type --- */
+   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+   --font-num: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+   --fs-xs:   0.75rem;   /* 12px */
+   --fs-sm:   0.875rem;  /* 14px */
+   --fs-md:   1rem;      /* 16px — never smaller on inputs (iOS zoom) */
+   --fs-lg:   1.25rem;   /* 20px */
+   --fs-xl:   1.5rem;    /* 24px */
+   --fs-num:  1.75rem;   /* 28px — the numbers you punch in at the gym */
+
+   /* --- space --- */
+   --sp-1: 0.25rem;
+   --sp-2: 0.5rem;
+   --sp-3: 0.75rem;
+   --sp-4: 1rem;
+   --sp-5: 1.5rem;
+   --sp-6: 2rem;
+
+   /* --- shape --- */
+   --r-sm: 8px;
+   --r-md: 12px;
+   --r-lg: 16px;
+   --r-pill: 999px;
+
+   --tap: 48px;              /* minimum touch target */
+   --maxw: 34rem;            /* content column */
+   --border-w: 1px;
+   --ring: 0 0 0 2px var(--accent);
+}
+
+/* ---------- reset-ish ---------- */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+   -webkit-text-size-adjust: 100%;
+   background: var(--bg);
+}
+
+body {
+   margin: 0;
+   font-family: var(--font);
+   font-size: var(--fs-md);
+   line-height: 1.4;
+   color: var(--text);
+   background: var(--bg);
+   -webkit-font-smoothing: antialiased;
+   padding: env(safe-area-inset-top) env(safe-area-inset-right)
+            env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+h1, h2, h3, p { margin: 0; }
+[hidden] { display: none !important; }
+
+button {
+   font: inherit;
+   color: inherit;
+   background: none;
+   border: 0;
+   margin: 0;
+   cursor: pointer;
+   -webkit-tap-highlight-color: transparent;
+}
+
+input, textarea {
+   font: inherit;
+   color: inherit;
+   background: var(--bg-input);
+   border: var(--border-w) solid var(--border);
+   border-radius: var(--r-sm);
+   -webkit-appearance: none;
+   appearance: none;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+button:focus-visible {
+   outline: none;
+   box-shadow: var(--ring);
+}
+
+/* ---------- shared buttons ---------- */
+
+.btn {
+   min-height: var(--tap);
+   padding: 0 var(--sp-4);
+   border-radius: var(--r-md);
+   font-size: var(--fs-md);
+   font-weight: 600;
+   display: inline-flex;
+   align-items: center;
+   justify-content: center;
+}
+.btn-primary { background: var(--accent); color: var(--accent-ink); }
+.btn-primary:disabled { opacity: 0.5; }
+.btn-ghost {
+   background: transparent;
+   border: var(--border-w) solid var(--border-strong);
+   color: var(--text-dim);
+}
+.btn-link {
+   min-height: auto;
+   padding: var(--sp-2);
+   font-size: var(--fs-sm);
+   font-weight: 500;
+   color: var(--text-faint);
+   text-decoration: underline;
+}
+
+/* ==========================================================================
+   Gate (first-run setup + settings)
+   ========================================================================== */
+
+.gate {
+   min-height: 100vh;
+   display: flex;
+   align-items: center;
+   justify-content: center;
+   padding: var(--sp-5) var(--sp-4);
+}
+
+.gate-card {
+   width: 100%;
+   max-width: 24rem;
+   display: flex;
+   flex-direction: column;
+   gap: var(--sp-4);
+   background: var(--bg-raised);
+   border: var(--border-w) solid var(--border);
+   border-radius: var(--r-lg);
+   padding: var(--sp-5) var(--sp-4);
+}
+
+.gate-title {
+   font-size: var(--fs-xl);
+   letter-spacing: 0.16em;
+   font-weight: 700;
+}
+.gate-sub {
+   font-size: var(--fs-sm);
+   color: var(--text-dim);
+   margin-top: calc(var(--sp-3) * -1);
+}
+
+.field { display: flex; flex-direction: column; gap: var(--sp-2); }
+.field-label {
+   font-size: var(--fs-xs);
+   text-transform: uppercase;
+   letter-spacing: 0.08em;
+   color: var(--text-faint);
+}
+.field input {
+   min-height: var(--tap);
+   padding: 0 var(--sp-3);
+   font-size: var(--fs-md);
+}
+
+.gate-msg {
+   font-size: var(--fs-sm);
+   color: var(--danger);
+   background: color-mix(in srgb, var(--danger) 12%, transparent);
+   border-radius: var(--r-sm);
+   padding: var(--sp-2) var(--sp-3);
+}
+.gate-msg.is-busy { color: var(--text-dim); background: var(--bg-sunken); }
+
+.gate-actions { display: flex; gap: var(--sp-3); }
+.gate-actions .btn { flex: 1; }
+
+/* ==========================================================================
+   Status screen
+   ========================================================================== */
+
+.status {
+   min-height: 60vh;
+   display: flex;
+   flex-direction: column;
+   align-items: center;
+   justify-content: center;
+   gap: var(--sp-4);
+   padding: var(--sp-5);
+   text-align: center;
+}
+.status-msg { color: var(--text-dim); font-size: var(--fs-sm); }
+
+/* ==========================================================================
+   App shell
+   ========================================================================== */
+
+.app {
+   max-width: var(--maxw);
+   margin: 0 auto;
+   /* --toast-room is set from JS to the live height of the toast stack. The
+      toasts are fixed to the bottom of the viewport, so without scroll room
+      underneath the content the last card's Save button can sit permanently
+      beneath an error toast that is waiting to be dismissed — with nowhere to
+      scroll it clear. It is 0 whenever no toast is showing. */
+   padding: 0 var(--sp-3) calc(var(--sp-6) + var(--toast-room, 0px));
+}
+
+.topbar {
+   position: sticky;
+   top: 0;
+   z-index: 5;
+   display: flex;
+   align-items: center;
+   justify-content: space-between;
+   gap: var(--sp-3);
+   padding: var(--sp-3) 0;
+   background: var(--bg);
+}
+
+.brand {
+   font-size: var(--fs-lg);
+   font-weight: 700;
+   letter-spacing: 0.16em;
+}
+
+.topbar-right { display: flex; align-items: center; gap: var(--sp-2); }
+
+.icon-btn {
+   width: var(--tap);
+   height: var(--tap);
+   display: inline-flex;
+   align-items: center;
+   justify-content: center;
+   border-radius: var(--r-pill);
+   color: var(--text-dim);
+}
+
+.pending {
+   font-size: var(--fs-xs);
+   font-weight: 600;
+   color: var(--warn);
+   background: color-mix(in srgb, var(--warn) 14%, transparent);
+   border: var(--border-w) solid color-mix(in srgb, var(--warn) 35%, transparent);
+   border-radius: var(--r-pill);
+   padding: var(--sp-2) var(--sp-3);
+   min-height: 34px;
+}
+
+/* ---------- day tabs ---------- */
+
+.tabs {
+   display: flex;
+   gap: var(--sp-2);
+   padding-bottom: var(--sp-3);
+}
+
+.tab {
+   flex: 1;
+   min-height: var(--tap);
+   display: flex;
+   flex-direction: column;
+   align-items: center;
+   justify-content: center;
+   gap: 2px;
+   padding: var(--sp-2);
+   border-radius: var(--r-md);
+   background: var(--bg-raised);
+   border: var(--border-w) solid var(--border);
+   color: var(--text-dim);
+   font-weight: 600;
+}
+.tab .tab-week {
+   font-size: var(--fs-xs);
+   font-weight: 500;
+   color: var(--text-faint);
+   letter-spacing: 0.04em;
+}
+.tab[aria-selected="true"] {
+   background: var(--accent);
+   border-color: var(--accent);
+   color: var(--accent-ink);
+}
+.tab[aria-selected="true"] .tab-week { color: var(--accent-ink); opacity: 0.75; }
+
+/* ---------- banner ---------- */
+
+.banner {
+   display: flex;
+   align-items: center;
+   justify-content: space-between;
+   gap: var(--sp-3);
+   padding: var(--sp-3) 0 var(--sp-4);
+   border-bottom: var(--border-w) solid var(--border);
+   margin-bottom: var(--sp-4);
+}
+
+.banner-text {
+   font-size: var(--fs-md);
+   font-weight: 700;
+   letter-spacing: -0.01em;
+}
+.banner-text .banner-sub {
+   display: block;
+   font-size: var(--fs-xs);
+   font-weight: 500;
+   color: var(--text-faint);
+   letter-spacing: 0.04em;
+   margin-top: 2px;
+}
+
+.date-input {
+   min-height: 40px;
+   padding: 0 var(--sp-3);
+   /* Must stay >= 16px: iOS Safari zooms the whole page in when you focus an
+      input with a smaller font, and never zooms back out. */
+   font-size: var(--fs-md);
+   color: var(--text-dim);
+   background: var(--bg-raised);
+}
+
+/* Disabled while a week override targets a block that ALREADY has a date: that
+   block keeps its own date, and the save deliberately does not rewrite it. (An
+   override onto an undated block leaves the field editable — dating it is the
+   only way that block ever gets a date.) */
+.date-input:disabled {
+   opacity: 0.6;
+   color: var(--warn);
+   /* Safari paints a disabled input's text with its own grey no matter what
+      `color` says, throwing away the one visual cue that an override is on. */
+   -webkit-text-fill-color: var(--warn);
+}
+
+/* ---------- offline (cached state) notice ---------- */
+
+/* Deliberately a strip in the flow, not an overlay: it must be impossible to
+   miss that the numbers are stale, and equally impossible for it to sit on top
+   of a card the user is trying to log into. */
+.offline {
+   margin: 0 var(--sp-4) var(--sp-2);
+   padding: var(--sp-2) var(--sp-3);
+   border: var(--border-w) solid var(--warn);
+   border-radius: var(--r-md);
+   background: var(--bg-raised);
+   font-size: var(--fs-xs);
+   font-weight: 600;
+   letter-spacing: 0.02em;
+   color: var(--warn);
+}
+
+/* ---------- "Needs review": conflicted queued saves ---------- */
+
+/* In the flow above the cards, like the offline strip: a queued set that was
+   deliberately NOT written is not something to hide behind a toast that can be
+   swiped away. Both ways out are full tap targets — there is no default. */
+.conflicts {
+   margin: 0 var(--sp-4) var(--sp-3);
+   padding: var(--sp-3);
+   border: var(--border-w) solid var(--danger);
+   border-radius: var(--r-md);
+   background: var(--bg-raised);
+   display: flex;
+   flex-direction: column;
+   gap: var(--sp-3);
+}
+
+.conflicts-title {
+   font-size: var(--fs-xs);
+   font-weight: 700;
+   letter-spacing: 0.06em;
+   text-transform: uppercase;
+   color: var(--danger);
+}
+
+.conflict { display: flex; flex-direction: column; gap: var(--sp-2); }
+.conflict-text { font-size: var(--fs-sm); color: var(--text); }
+.conflict-actions { display: flex; gap: var(--sp-2); }
+.conflict-actions .btn { flex: 1; min-height: var(--tap); }
+
+/* ---------- week override ---------- */
+
+.week-pick {
+   font: inherit;
+   color: var(--accent);
+   background: none;
+   border: none;
+   padding: 0;
+   text-decoration: underline;
+   text-underline-offset: 3px;
+   text-decoration-color: var(--border-strong);
+   cursor: pointer;
+}
+.week-pick.is-override { color: var(--warn); }
+
+.banner-text .week-flag {
+   display: block;
+   margin-top: 2px;
+   font-size: var(--fs-xs);
+   font-weight: 600;
+   letter-spacing: 0.04em;
+   color: var(--warn);
+   text-transform: uppercase;
+}
+
+.tab-week.is-override { color: var(--warn); opacity: 1; }
+
+.week-picker {
+   padding: var(--sp-3);
+   margin-bottom: var(--sp-4);
+   background: var(--bg-raised);
+   border: var(--border-w) solid var(--border-strong);
+   border-radius: var(--r-md);
+}
+
+.week-select {
+   width: 100%;
+   min-height: var(--tap);
+   padding: 0 var(--sp-3);
+   font-size: var(--fs-md);        /* >= 16px: no iOS focus zoom */
+   color: var(--text);
+   background: var(--bg-input);
+   border: var(--border-w) solid var(--border-strong);
+   border-radius: var(--r-sm);
+}
+
+.week-hint {
+   margin: var(--sp-2) 0 0;
+   font-size: var(--fs-xs);
+   color: var(--text-faint);
+}
+
+/* ---------- program complete ---------- */
+
+.complete {
+   padding: var(--sp-6) var(--sp-4);
+   text-align: center;
+   background: var(--bg-raised);
+   border: var(--border-w) solid var(--border);
+   border-radius: var(--r-lg);
+}
+.complete-title { margin: 0; font-size: var(--fs-lg); font-weight: 700; }
+.complete-sub {
+   margin: var(--sp-2) 0 0;
+   font-size: var(--fs-sm);
+   color: var(--text-dim);
+}
+
+/* ==========================================================================
+   Exercise cards
+   ========================================================================== */
+
+.cards { display: flex; flex-direction: column; gap: var(--sp-4); }
+
+.card {
+   background: var(--bg-raised);
+   border: var(--border-w) solid var(--border);
+   border-radius: var(--r-lg);
+   padding: var(--sp-4);
+   display: flex;
+   flex-direction: column;
+   gap: var(--sp-3);
+}
+
+.card-head {
+   display: flex;
+   align-items: flex-start;
+   justify-content: space-between;
+   gap: var(--sp-3);
+}
+
+.ex-name { font-size: var(--fs-lg); font-weight: 700; line-height: 1.2; }
+
+.target {
+   font-size: var(--fs-sm);
+   color: var(--text-dim);
+   font-family: var(--font-num);
+   margin-top: calc(var(--sp-2) * -1);
+}
+
+.note {
+   font-size: var(--fs-sm);
+   color: var(--text-faint);
+   font-style: italic;
+}
+
+.last {
+   font-size: var(--fs-sm);
+   color: var(--text-dim);
+   background: var(--bg-sunken);
+   border-radius: var(--r-sm);
+   padding: var(--sp-2) var(--sp-3);
+}
+.last.is-empty { color: var(--text-faint); }
+
+/* ---------- badge ---------- */
+
+.badge {
+   flex: none;
+   font-size: var(--fs-xs);
+   font-weight: 700;
+   letter-spacing: 0.04em;
+   border-radius: var(--r-pill);
+   padding: var(--sp-2) var(--sp-3);
+   background: var(--bg-sunken);
+   border: var(--border-w) solid var(--border);
+   color: var(--text-faint);
+   white-space: nowrap;
+}
+.badge[data-state="dirty"]  { color: var(--warn);   border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.badge[data-state="saving"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.badge[data-state="saved"]  { color: var(--ok);     border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.badge[data-state="queued"] { color: var(--warn);   border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+/* Waiting on the user, not on signal — same weight as an error, because it is
+   the one state that will never resolve itself. */
+.badge[data-state="review"] { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+.badge[data-state="error"]  { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+
+/* ---------- variation toggle (bench) ---------- */
+
+.variants {
+   display: flex;
+   gap: var(--sp-1);
+   background: var(--bg-sunken);
+   border-radius: var(--r-md);
+   padding: var(--sp-1);
+}
+.seg {
+   flex: 1;
+   min-height: 40px;
+   border-radius: calc(var(--r-md) - var(--sp-1));
+   font-size: var(--fs-sm);
+   font-weight: 600;
+   color: var(--text-dim);
+}
+.seg[aria-pressed="true"] {
+   background: var(--bg-input);
+   color: var(--text);
+   box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+/* ---------- set rows ---------- */
+
+.sets { display: flex; flex-direction: column; gap: var(--sp-2); }
+
+.set-row {
+   display: flex;
+   align-items: center;
+   gap: var(--sp-2);
+}
+
+.set-label {
+   flex: none;
+   width: 2rem;
+   font-size: var(--fs-xs);
+   font-weight: 700;
+   letter-spacing: 0.06em;
+   color: var(--text-faint);
+}
+
+.num {
+   flex: 1;
+   min-width: 0;
+   min-height: 56px;
+   padding: 0 var(--sp-2);
+   text-align: center;
+   font-family: var(--font-num);
+   font-size: var(--fs-num);
+   font-weight: 600;
+   border-radius: var(--r-md);
+}
+/* placeholders echo last week's numbers — must never read as entered values */
+.num::placeholder { color: var(--text-faint); font-weight: 400; opacity: 0.42; }
+.num.is-reps { flex: 0 1 32%; }
+
+.x { flex: none; color: var(--text-faint); font-size: var(--fs-lg); }
+
+/* ---------- notes ---------- */
+
+.note-toggle {
+   align-self: flex-start;
+   font-size: var(--fs-sm);
+   color: var(--text-faint);
+   padding: var(--sp-2) 0;
+   min-height: 32px;
+}
+
+.notes {
+   width: 100%;
+   min-height: 64px;
+   padding: var(--sp-3);
+   font-size: var(--fs-md);
+   resize: vertical;
+}
+
+/* ---------- save ---------- */
+
+.save {
+   min-height: var(--tap);
+   border-radius: var(--r-md);
+   font-weight: 700;
+   background: var(--bg-input);
+   border: var(--border-w) solid var(--border-strong);
+   color: var(--text);
+}
+.save.is-cta { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.save:disabled { opacity: 0.55; }
+
+/* ---------- empty day ---------- */
+
+.empty {
+   padding: var(--sp-6) var(--sp-4);
+   text-align: center;
+   color: var(--text-faint);
+   font-size: var(--fs-sm);
+}
+
+.foot {
+   margin-top: var(--sp-5);
+   text-align: center;
+   font-size: var(--fs-xs);
+   color: var(--text-faint);
+}
+
+/* ==========================================================================
+   Toasts
+   ========================================================================== */
+
+/* Error toasts stay until dismissed, so the stack has to be bounded or it
+   climbs the screen and buries the bottom card's Save button. The JS caps it at
+   three; the max-height + scroll is the belt-and-braces. `pointer-events: none`
+   here (with `auto` on the toasts themselves) keeps every tap that misses a
+   toast going to the card underneath. */
+.toasts {
+   position: fixed;
+   left: 0;
+   right: 0;
+   bottom: calc(env(safe-area-inset-bottom) + var(--sp-4));
+   z-index: 20;
+   display: flex;
+   flex-direction: column;
+   align-items: center;
+   gap: var(--sp-2);
+   padding: 0 var(--sp-4);
+   max-height: 45vh;
+   overflow-y: auto;
+   overscroll-behavior: contain;
+   pointer-events: none;
+}
+
+.toast {
+   pointer-events: auto;
+   width: 100%;
+   max-width: var(--maxw);
+   display: flex;
+   align-items: center;
+   gap: var(--sp-3);
+   background: var(--bg-input);
+   border: var(--border-w) solid var(--border-strong);
+   border-radius: var(--r-md);
+   padding: var(--sp-3);
+   font-size: var(--fs-sm);
+   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.toast[data-kind="error"] { border-color: var(--danger); }
+.toast[data-kind="ok"]    { border-color: var(--ok); }
+.toast[data-kind="warn"]  { border-color: var(--warn); }
+.toast-text { flex: 1; }
+
+/* A toast that offers something to do never auto-dismisses, so its button has
+   to be a real tap target rather than a link-sized afterthought. */
+.toast-act {
+   flex: none;
+   min-height: 32px;
+   padding: 0 var(--sp-3);
+   border: var(--border-w) solid var(--border-strong);
+   border-radius: var(--r-pill);
+   color: var(--accent);
+   font-size: var(--fs-xs);
+   font-weight: 700;
+}
+.toast-x {
+   flex: none;
+   width: 32px;
+   height: 32px;
+   border-radius: var(--r-pill);
+   color: var(--text-faint);
+   font-size: var(--fs-lg);
+   line-height: 1;
+}
+
+/* ==========================================================================
+   Motion
+   ========================================================================== */
+
+@media (prefers-reduced-motion: no-preference) {
+   .badge, .save, .tab, .seg { transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease; }
+}
